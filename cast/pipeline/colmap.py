@@ -1,0 +1,185 @@
+"""COLMAP, run as a subprocess (it is in the worker image): camera poses, then a dense cloud.
+
+Checked against COLMAP 4.2.1 (colmap/colmap image). Option names that changed between releases
+are looked up in the command's own help. Pose reading and pair lists come from FleshForge.
+"""
+
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+from cast.pipeline import PipelineError
+
+EXHAUSTIVE_MAX = 250  # above this many frames, match a chosen list of pairs
+PAIR_WINDOW, PAIR_STRIDE = 10, 8
+MIN_REGISTERED = 0.8  # fraction of frames that must get a camera pose
+
+_help: dict = {}
+
+
+def available() -> bool:
+    return shutil.which("colmap") is not None
+
+
+def run(command: str, args: list, log: Path) -> float:
+    cmd = ["colmap", command, *[str(a) for a in args]]
+    start = time.time()
+    with open(log, "a", encoding="utf-8", errors="replace") as fh:
+        fh.write(f"\n===== {' '.join(cmd)}\n")
+        fh.flush()
+        code = subprocess.run(cmd, check=False, stdout=fh, stderr=subprocess.STDOUT).returncode
+    if code != 0:
+        tail = "\n".join(log.read_text(errors="replace").splitlines()[-8:])
+        raise RuntimeError(f"colmap {command} failed (exit {code}):\n{tail}")
+    return time.time() - start
+
+
+def option(command: str, *names: str) -> str:
+    if command not in _help:
+        done = subprocess.run(["colmap", command, "-h"], check=False, capture_output=True, text=True)
+        _help[command] = done.stdout + done.stderr
+    for name in names:
+        if name + " " in _help[command] or name + "\n" in _help[command]:
+            return name
+    raise RuntimeError(f"colmap {command} accepts none of {names}")
+
+
+def match_pairs(names: list, window: int = PAIR_WINDOW, stride: int = PAIR_STRIDE) -> list:
+    """Neighbours in order plus every `stride`-th frame: links laps and both passes."""
+    n, keep = len(names), set()
+    for i in range(n):
+        for j in range(i + 1, min(n, i + window + 1)):
+            keep.add((i, j))
+        for j in range(0, n, stride):
+            if j != i:
+                keep.add((min(i, j), max(i, j)))
+    return [(names[i], names[j]) for i, j in sorted(keep)]
+
+
+@dataclass
+class Model:
+    folder: Path
+    names: list  # registered image names
+    centres: np.ndarray  # (N, 3) camera centres
+    ups: np.ndarray  # (N, 3) camera up vectors (world)
+    forwards: np.ndarray  # (N, 3) viewing directions (world)
+    points: int
+    error: float
+
+
+def quat_to_rot(qw, qx, qy, qz) -> np.ndarray:
+    w, x, y, z = np.array([qw, qx, qy, qz], float) / np.linalg.norm([qw, qx, qy, qz])
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+def parse_images_txt(text: str):
+    """images.txt: pose lines alternate with point lines (which may be empty)."""
+    lines = [ln for ln in text.splitlines() if not ln.startswith("#")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    names, centres, ups, fwds = [], [], [], []
+    for header in lines[0::2]:
+        tok = header.split()
+        R = quat_to_rot(*map(float, tok[1:5]))
+        t = np.array(list(map(float, tok[5:8])))
+        names.append(" ".join(tok[9:]))
+        centres.append(-R.T @ t)
+        ups.append(-R[1])  # COLMAP camera: +y down, +z forward
+        fwds.append(R[2])
+    return names, np.array(centres), np.array(ups), np.array(fwds)
+
+
+def read_model(folder: Path, log: Path) -> Model:
+    txt = folder.parent / (folder.name + "_txt")
+    shutil.rmtree(txt, ignore_errors=True)
+    txt.mkdir()
+    run("model_converter", ["--input_path", folder, "--output_path", txt, "--output_type", "TXT"],
+        log)
+    names, centres, ups, fwds = parse_images_txt((txt / "images.txt").read_text(errors="replace"))
+    errs = [float(ln.split()[7]) for ln in (txt / "points3D.txt").read_text().splitlines()
+            if ln and not ln.startswith("#")]
+    shutil.rmtree(txt)
+    return Model(folder, names, centres, ups, fwds, len(errs),
+                 float(np.mean(errs)) if errs else float("nan"))
+
+
+def largest(sparse: Path, log: Path) -> Model | None:
+    models = [read_model(p, log) for p in sorted(sparse.iterdir())
+              if p.is_dir() and (p / "images.bin").exists()]
+    return max(models, key=lambda m: len(m.names)) if models else None
+
+
+def poses(images: Path, masks: Path | None, work: Path, log: Path) -> tuple[Model, dict]:
+    """Features, matching, mapping. Returns the model with the most frames, and timings."""
+    work.mkdir(parents=True, exist_ok=True)
+    db = work / "database.db"
+    for old in work.glob("database.db*"):
+        old.unlink()
+    names = sorted(p.name for p in images.glob("*.jpg"))
+    secs = {}
+
+    args = ["--database_path", db, "--image_path", images,
+            "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "SIMPLE_RADIAL",
+            option("feature_extractor", "--FeatureExtraction.use_gpu", "--SiftExtraction.use_gpu"),
+            "1"]
+    if masks is not None:
+        args += ["--ImageReader.mask_path", masks]
+    secs["features"] = run("feature_extractor", args, log)
+
+    if len(names) <= EXHAUSTIVE_MAX:
+        matcher, margs = "exhaustive_matcher", []
+    else:
+        pairs = work / "pairs.txt"
+        pairs.write_text("".join(f"{a} {b}\n" for a, b in match_pairs(names)))
+        matcher, margs = "matches_importer", ["--match_list_path", pairs, "--match_type", "pairs"]
+    gpu = option(matcher, "--FeatureMatching.use_gpu", "--SiftMatching.use_gpu")
+    secs["matching"] = run(matcher, ["--database_path", db, gpu, "1", *margs], log)
+
+    best = None
+    for mapper in ("global_mapper", "mapper"):  # global first (fast); incremental if it falls short
+        out = work / mapper
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir()
+        try:
+            secs[mapper] = run(mapper, ["--database_path", db, "--image_path", images,
+                                        "--output_path", out], log)
+            model = largest(out, log)
+        except RuntimeError:
+            model = None
+        if model and (best is None or len(model.names) > len(best.names)):
+            best = model
+        if best and len(best.names) >= MIN_REGISTERED * len(names):
+            break
+    if best is None:
+        raise PipelineError("No camera positions could be found. The object needs more texture "
+                            "or light, or the walk round was too fast.")
+    return best, secs
+
+
+def dense(images: Path, model: Model, work: Path, log: Path, max_size: int = 1600) -> dict:
+    """Undistort and compute a depth map per frame (GPU). Returns timings."""
+    shutil.rmtree(work, ignore_errors=True)
+    secs = {"undistort": run("image_undistorter", [
+        "--image_path", images, "--input_path", model.folder, "--output_path", work,
+        "--output_type", "COLMAP", "--max_image_size", max_size], log)}
+    secs["stereo"] = run("patch_match_stereo", [
+        "--workspace_path", work, "--workspace_format", "COLMAP",
+        "--PatchMatchStereo.geom_consistency", "1",
+        "--PatchMatchStereo.window_radius", "4", "--PatchMatchStereo.window_step", "2",
+        "--PatchMatchStereo.num_samples", "10"], log)
+    return secs
+
+
+def fuse(work: Path, out_ply: Path, masks: Path | None, log: Path) -> float:
+    args = ["--workspace_path", work, "--workspace_format", "COLMAP",
+            "--input_type", "geometric", "--output_path", out_ply]
+    if masks is not None:
+        args += ["--StereoFusion.mask_path", masks]
+    return run("stereo_fusion", args, log)

@@ -6,6 +6,7 @@ Set-Location (Join-Path $PSScriptRoot "..")
 git pull -q
 $env:DOCKER_BUILDKIT = "0"
 docker build -q -f docker/Dockerfile -t cast:local .
+docker build -q -f docker/Dockerfile.worker -t cast-worker:local .
 Set-Location docker
 docker compose up -d
 docker compose ps --format "{{.Service}} {{.State}} {{.CreatedAt}}"

@@ -1,7 +1,7 @@
 """The worker: one job at a time, found by polling SQLite.
 
-Phase 1 job: check each received upload is one real video within limits. The pipeline stages
-(cast/pipeline) are added here as they are built.
+Jobs, in order: check each received upload is one real video within limits, then (in the GPU
+image, where COLMAP is installed) reconstruct checked captures one at a time.
 """
 
 import json
@@ -83,21 +83,58 @@ def drop_stale(cfg: config.Config) -> None:
             shutil.rmtree(cfg.inbox / r["id"], ignore_errors=True)
 
 
-def step(cfg: config.Config) -> bool:
+def reconstruct(cfg: config.Config, cap) -> None:
+    from cast.pipeline import PipelineError
+    from cast.pipeline.run import process
+
+    cid = cap["id"]
+    with db.connect(cfg.db) as con:
+        db.set_capture(con, cid, status="processing", error="")
+
+    def progress(stage):
+        with db.connect(cfg.db) as con:
+            db.set_capture(con, cid, stage=stage)
+
+    meta = json.loads(cap["meta"])
+    try:
+        report = process(db.video_path(cfg.inbox, cid, cap["mime"]), meta, cap["mode"],
+                         cfg.runs / cid, progress)
+    except PipelineError as e:
+        with db.connect(cfg.db) as con:
+            db.set_capture(con, cid, status="failed", error=str(e))
+        return
+    meta["report"] = report
+    with db.connect(cfg.db) as con:
+        db.set_capture(con, cid, status="done", stage="", meta=meta)
+
+
+def step(cfg: config.Config, can_reconstruct: bool = False) -> bool:
     """Do one job if there is one. True if something was done."""
     with db.connect(cfg.db) as con:
         cap = con.execute(
             "SELECT * FROM captures WHERE status = 'received' ORDER BY updated LIMIT 1"
         ).fetchone()
+        job = check
+        if cap is None and can_reconstruct:
+            # 'processing' first: a job the worker was doing when it last stopped
+            cap = con.execute(
+                "SELECT * FROM captures WHERE status IN ('processing', 'checked')"
+                " ORDER BY status = 'processing' DESC, updated LIMIT 1"
+            ).fetchone()
+            job = reconstruct
     if cap is None:
         return False
     try:
-        check(cfg, cap)
+        job(cfg, cap)
     except Exception:  # never let one bad job crash-loop the worker and block the queue
-        log.exception("checking capture %s failed", cap["id"])
+        log.exception("%s of capture %s failed", job.__name__, cap["id"])
         with db.connect(cfg.db) as con:
-            db.set_capture(con, cap["id"], status="rejected",
-                           error="The server could not check this video. Please record again.")
+            if job is check:
+                db.set_capture(con, cap["id"], status="rejected",
+                               error="The server could not check this video. Please record again.")
+            else:  # a bug or crash, not the capture's fault: keep it retryable from studio
+                db.set_capture(con, cap["id"], status="failed",
+                               error="Reconstruction crashed. See the worker log, then Retry.")
     return True
 
 
@@ -105,6 +142,10 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = config.load()
     db.init(cfg.db)
+    from cast.pipeline import colmap
+
+    can_reconstruct = colmap.available()
+    log.info("worker started; reconstruction %s", "on" if can_reconstruct else "off (no COLMAP)")
     beat = cfg.data / "worker.heartbeat"
     last_sweep = 0.0
     while True:
@@ -112,5 +153,5 @@ def main():
         if time.time() - last_sweep > 3600:
             drop_stale(cfg)
             last_sweep = time.time()
-        if not step(cfg):
+        if not step(cfg, can_reconstruct):
             time.sleep(2)

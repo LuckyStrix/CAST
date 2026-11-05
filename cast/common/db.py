@@ -38,12 +38,14 @@ CREATE TABLE IF NOT EXISTS captures (
     chunks INTEGER,
     meta TEXT NOT NULL DEFAULT '{}',
     error TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT '',
     created REAL NOT NULL,
     updated REAL NOT NULL
 );
 """
 
 # Capture status: uploading -> received (all chunks joined) -> checked | rejected (worker)
+#   -> processing (stage = current pipeline stage) -> done | failed
 # An upload can also end as cancelled (by the phone) or abandoned (no activity for weeks).
 CLOSED = ("rejected", "abandoned", "cancelled")  # these don't use up an invite's capture limit
 
@@ -80,6 +82,9 @@ def connect(path: Path):
 def init(path: Path) -> None:
     with connect(path) as con:
         con.executescript(SCHEMA)
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(captures)")}
+        if "stage" not in cols:  # databases from before Phase 2
+            con.execute("ALTER TABLE captures ADD COLUMN stage TEXT NOT NULL DEFAULT ''")
 
 
 def create_project(con, name: str, mode: str) -> int:

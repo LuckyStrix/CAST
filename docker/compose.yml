@@ -42,11 +42,17 @@ services:
     networks: [studio_net]
     restart: unless-stopped
 
-  worker:
-    image: cast:local
+  worker:  # GPU: COLMAP + the reconstruction pipeline
+    build: { context: .., dockerfile: docker/Dockerfile.worker }
+    image: cast-worker:local
     command: cast-worker
     volumes: [cast-data:/data]
     network_mode: none
+    shm_size: 2gb
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
     restart: unless-stopped
 
 networks:

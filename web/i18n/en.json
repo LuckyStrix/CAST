@@ -53,7 +53,9 @@
 
   "status_title": "Thank you!",
   "status_received": "Received. Checking the video…",
-  "status_checked": "The video is good. It will be made into a 3D model.",
+  "status_checked": "The video is good. It is being made into a 3D model (this takes several minutes). You can close this page.",
+  "status_done": "The 3D model is ready. Thank you!",
+  "status_model_failed": "The video arrived, but a 3D model could not be made: {error}",
   "status_rejected": "There was a problem: {error}",
   "status_failed": "Sending failed: {error}",
   "record_another": "Scan another object",

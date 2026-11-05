@@ -76,14 +76,29 @@ async function showProject(id) {
     if (v) notes.push(`${v.width}×${v.height} ${v.codec}, ${v.duration}s`);
     if (c.meta.phone && c.meta.phone.markers) notes.push(c.meta.phone.markers.map((m) => `${m.event}@${m.t}s`).join(" "));
     if (c.meta.phone && c.meta.phone.sensor === false) notes.push("no motion sensor");
+    const r = c.meta.report;
+    if (r && r.poses) notes.push(`placed ${r.poses.placed}/${r.poses.frames} frames`);
+    if (r && r.seconds) notes.push(`${Math.round(Object.values(r.seconds).reduce((a, b) => a + b, 0) / 60)} min`);
     if (c.error) notes.push(c.error);
-    const ready = ["received", "checked", "rejected"].includes(c.status);
+    const hasVideo = !["uploading", "cancelled", "abandoned"].includes(c.status);
+    const bad = ["rejected", "failed"].includes(c.status);
     return el("tr", {},
       el("td", {}, when(c.created)), el("td", {}, c.mode),
-      el("td", { class: c.status === "rejected" ? "bad" : c.status === "checked" ? "ok" : "" }, c.status),
-      el("td", {}, ready ? el("a", { href: `/api/captures/${c.id}/video`, target: "_blank" }, "play") : ""),
+      el("td", { class: bad ? "bad" : c.status === "done" ? "ok" : "" },
+        c.status === "processing" ? `processing: ${c.stage || "starting"}` : c.status === "checked" ? "waiting for GPU" : c.status),
+      el("td", {}, hasVideo ? el("a", { href: `/api/captures/${c.id}/video`, target: "_blank" }, "play") : ""),
+      el("td", {}, ...modelCell(c)),
       el("td", { class: "muted" }, notes.join(" · ")));
   }));
+}
+
+function modelCell(c) {
+  const retry = (label) => el("button", { class: "plain", onclick: async () => {
+    await api("POST", `/api/captures/${c.id}/retry`); showProject(current);
+  } }, label);
+  if (c.status === "done") return [el("a", { href: `/view?c=${c.id}`, target: "_blank" }, "view 3D"), " ", retry("redo")];
+  if (c.status === "failed") return [retry("retry")];
+  return [];
 }
 
 $("#new-project").addEventListener("submit", async (e) => {

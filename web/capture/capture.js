@@ -243,9 +243,16 @@ function endPass1() {
   }
 }
 
+// After a pass changes, hide "gone all the way round" briefly: a double tap must not skip a pass.
+function pauseRoundButton() {
+  $("round-done").hidden = true;
+  setTimeout(() => { if (pass === 2 && $("finish").hidden) $("round-done").hidden = false; }, 2500);
+}
+
 function startPass2() {
   mark("pass2_start");
   pass = 2;
+  pauseRoundButton();
   turn.reset();
   $("flip").hidden = true;
   $("pass-label").textContent = t("pass_label", { n: 2 });
@@ -297,13 +304,15 @@ function showStatus(text) {
 
 async function pollStatus(id) {
   showStatus(t("status_received"));
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 360; i++) { // up to 30 minutes: reconstruction takes a while
     try {
       const s = await serverStatus(token, id);
-      if (s.status === "checked") return showStatus(t("status_checked"));
+      if (s.status === "checked" || s.status === "processing") showStatus(t("status_checked"));
+      if (s.status === "done") return showStatus(t("status_done"));
+      if (s.status === "failed") return showStatus(t("status_model_failed", { error: s.error }));
       if (s.status === "rejected") return showStatus(t("status_rejected", { error: s.error }));
     } catch { /* keep trying */ }
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, 5000));
   }
 }
 

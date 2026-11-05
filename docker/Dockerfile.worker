@@ -1,0 +1,32 @@
+# GPU worker: COLMAP (CUDA) from the official image, plus Python for the CAST pipeline.
+# Needs an NVIDIA GPU and Docker's GPU support (Docker Desktop on Windows has it built in).
+FROM colmap/colmap:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv ffmpeg libgl1 libglib2.0-0 libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# uid 1000 owns /data in every CAST container (Ubuntu's image ships a user "ubuntu" with it)
+RUN (userdel -r ubuntu 2>/dev/null || true) && useradd --create-home --uid 1000 cast \
+ && mkdir -p /data && chown cast /data
+
+RUN python3 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1
+RUN pip install --no-cache-dir numpy scipy opencv-python-headless pillow open3d \
+      "rembg[gpu]" "onnxruntime-gpu[cuda,cudnn]"
+
+# The masking model is fetched now, so the worker never needs the internet
+USER cast
+RUN python -c "from rembg import new_session; new_session('birefnet-general-lite', providers=['CPUExecutionProvider'])"
+USER root
+
+WORKDIR /app
+COPY pyproject.toml ./
+COPY cast ./cast
+COPY web ./web
+RUN pip install --no-cache-dir --no-deps . && pip install --no-cache-dir fastapi uvicorn segno
+
+ENV CAST_DATA=/data CAST_WEB=/app/web
+USER cast
+CMD ["cast-worker"]

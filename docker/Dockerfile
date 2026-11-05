@@ -1,5 +1,4 @@
-# Phase 1 image: web apps and the upload check. The GPU pipeline (CUDA, COLMAP, models) is added
-# in Phase 2.
+# Web image: the capture and studio apps. (The GPU worker has its own: Dockerfile.worker.)
 FROM python:3.12-slim
 
 RUN apt-get update \

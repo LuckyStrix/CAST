@@ -24,6 +24,10 @@ class Config:
     def inbox(self) -> Path:
         return self.data / "inbox"
 
+    @property
+    def runs(self) -> Path:
+        return self.data / "runs"
+
 
 def load() -> Config:
     env = os.environ.get

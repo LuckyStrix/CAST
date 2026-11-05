@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import time
+from pathlib import Path
 
 import segno
 import uvicorn
@@ -44,6 +45,10 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
     @app.get("/")
     def index():
         return FileResponse(web / "studio" / "index.html")
+
+    @app.get("/view")
+    def viewer():
+        return FileResponse(web / "studio" / "view.html")
 
     @app.get("/api/status")
     def status(request: Request):
@@ -143,6 +148,38 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
         if not path.exists():
             raise HTTPException(404, "not uploaded yet")
         return FileResponse(path, media_type=cap["mime"])
+
+    def run_file(cid: str, name: str) -> Path:
+        if not db.is_capture_id(cid):
+            raise HTTPException(404, "no such capture")
+        path = cfg.runs / cid / name
+        if not path.exists():
+            raise HTTPException(404, "not made yet")
+        return path
+
+    @app.get("/api/captures/{cid}/model.glb")
+    def model(cid: str):
+        return FileResponse(run_file(cid, "model.glb"), media_type="model/gltf-binary",
+                            filename=f"cast-{cid[:8]}.glb")
+
+    @app.get("/api/captures/{cid}/report")
+    def report(cid: str):
+        return FileResponse(run_file(cid, "report.json"), media_type="application/json")
+
+    @app.post("/api/captures/{cid}/retry")
+    def retry(cid: str):
+        """Run reconstruction again: a failed run continues from the stage that failed, a
+        finished one starts over (e.g. after the pipeline has improved)."""
+        with db.connect(cfg.db) as con:
+            cap = con.execute("SELECT status FROM captures WHERE id = ?", (cid,)).fetchone()
+            if cap is None:
+                raise HTTPException(404, "no such capture")
+            if cap["status"] not in ("failed", "done"):
+                raise HTTPException(409, f"cannot retry a capture that is {cap['status']}")
+            if cap["status"] == "done":
+                shutil.rmtree(cfg.runs / cid, ignore_errors=True)
+            db.set_capture(con, cid, status="checked", error="", stage="")
+        return {"ok": True}
 
     return app
 
