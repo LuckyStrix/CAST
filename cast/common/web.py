@@ -12,6 +12,7 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": (
         "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+        "connect-src 'self' blob:; "
         "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
     ),
 }
