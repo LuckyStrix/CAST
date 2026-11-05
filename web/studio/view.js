@@ -58,8 +58,10 @@ async function load() {
   model.traverse((o) => {
     if (!o.isMesh) return;
     o.geometry.computeVertexNormals();
-    shaded[o.id] = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0, side: THREE.DoubleSide });
-    flat[o.id] = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    // colour from a texture (photos) or per vertex (points), whichever the model has
+    const look = { map: o.material.map || null, vertexColors: !!o.geometry.attributes.color, side: THREE.DoubleSide };
+    shaded[o.id] = new THREE.MeshStandardMaterial({ ...look, roughness: 1, metalness: 0 });
+    flat[o.id] = new THREE.MeshBasicMaterial(look);
     o.material = shaded[o.id];
   });
   scene.add(model);

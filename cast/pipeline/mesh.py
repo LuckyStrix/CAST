@@ -50,7 +50,9 @@ def up_rotation(up: np.ndarray) -> np.ndarray:
     return np.eye(3) + vx + vx @ vx * (1 / (1 + c))
 
 
-def build(cloud: Path, centre: np.ndarray, radius: float, up: np.ndarray, depth: int = 10) -> Mesh:
+def build(cloud: Path, centre: np.ndarray, radius: float, depth: int = 10) -> Mesh:
+    """The trimmed surface, in the camera model's coordinates (so photos can be projected onto
+    it); `upright` places it for viewing."""
     import open3d as o3d
     from scipy.spatial import cKDTree
 
@@ -91,16 +93,33 @@ def build(cloud: Path, centre: np.ndarray, radius: float, up: np.ndarray, depth:
     _, idx = cKDTree(pts).query(v, k=min(6, len(pts)))
     colors = cols[idx].mean(axis=1) if idx.ndim == 2 else cols[idx]
 
-    # Upright, centred, a nominal size (scale is unknown until a marker card is used).
-    R = up_rotation(up)
-    v = (v - centre) @ R.T
-    lo, hi = v.min(axis=0), v.max(axis=0)
-    scale = SIZE / float((hi - lo).max())
-    v = (v - (lo + hi) / 2) * scale
-    mesh.vertices = o3d.utility.Vector3dVector(v)
     mesh.compute_vertex_normals()
     edges = mesh.get_non_manifold_edges(allow_boundary_edges=False)
     stats = {"points_fused": n_fused, "points_used": n_clean,
              "vertices": len(v), "triangles": len(mesh.triangles),
              "open": len(np.asarray(edges)) > 0, "scale_known": False}
     return Mesh(v, np.asarray(mesh.triangles), colors, np.asarray(mesh.vertex_normals), stats)
+
+
+def vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    n = np.zeros_like(vertices, dtype=np.float64)
+    fn = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]],
+                  vertices[faces[:, 2]] - vertices[faces[:, 0]])
+    for k in range(3):
+        np.add.at(n, faces[:, k], fn)
+    return n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+
+
+def placement(vertices: np.ndarray, centre: np.ndarray, up: np.ndarray):
+    """Model coordinates -> upright, centred, a nominal size (the real scale is unknown until a
+    marker card is used). Returns `place(vertices, normals) -> (vertices, normals)`, the same
+    move for every part of the model."""
+    R = up_rotation(up)
+    v = (vertices - centre) @ R.T
+    lo, hi = v.min(axis=0), v.max(axis=0)
+    mid, scale = (lo + hi) / 2, SIZE / float((hi - lo).max())
+
+    def place(vs, normals):
+        return ((vs - centre) @ R.T - mid) * scale, normals @ R.T
+
+    return place

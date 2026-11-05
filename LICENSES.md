@@ -20,6 +20,7 @@ Add every new dependency or model here **before** using it.
 | three.js r170 (vendored) | studio viewer | MIT | in use |
 | ALIKED (COLMAP's `aliked-n16rot.onnx`) | features for camera solving | BSD-3-Clause | in use |
 | LightGlue (COLMAP's `aliked-lightglue.onnx`) | feature matching | Apache-2.0 | in use |
+| mvs-texturing (texrecon) with mve, rayint, mapmap_cpu; Eigen (MPL-2-only mode) | texture from the photos | BSD-3 / MPL-2.0 | in use, built from pinned sources |
 | OpenCV aruco | scale markers | Apache-2.0 | planned (Phase 5) |
 | gsplat (2DGS) | fast surfaces | Apache-2.0 | planned (Phase 6) |
 | VGGT commercial checkpoint / MapAnything | live coverage | to check | candidates (Phase 4) |

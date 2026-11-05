@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cast.pipeline import PipelineError, colmap, frames, glb, masks, mesh
+from cast.pipeline import PipelineError, colmap, frames, glb, masks, mesh, texture
 
 STAGES = ["frames", "masks", "poses", "dense", "mesh"]
 # Two passes are joined only if enough 3D points were seen from both, spread round the object.
@@ -145,10 +145,27 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
         distance = float(np.median(np.linalg.norm(centres - centre, axis=1)))
         first = np.array([n.startswith("p1_") for n in cams["names"]])
         up = ups[first].mean(axis=0) if first.any() else ups.mean(axis=0)
-        m = mesh.build(cloud, centre, radius=0.8 * distance, up=up)
-        glb.write_glb(run_dir / "model.glb", m.vertices, m.faces, m.colors, m.normals)
+        m = mesh.build(cloud, centre, radius=0.8 * distance)
         report["mesh"] = m.stats
         note(f"mesh: {m.stats['triangles']:,} triangles")
+        place = mesh.placement(m.vertices, centre, up)
+        try:  # colour from the photos; point colours if that fails
+            parts, report["texture"] = texture.make(dense_dir, m.vertices, m.faces,
+                                                    run_dir / "texture", log)
+        except Exception as e:  # noqa: BLE001
+            note(f"mesh: texturing failed ({e}); using point colours")
+            parts = None
+        if parts:
+            out = []
+            for v, uv, f, image in parts:
+                pv, pn = place(v, mesh.vertex_normals(v, f))
+                out.append((pv, pn, uv, f, image.read_bytes() if image else None))
+            glb.write_textured_glb(run_dir / "model.glb", out)
+            note(f"mesh: textured from {report['texture']['views']} photos in "
+                 f"{report['texture']['seconds']} s")
+        else:
+            v, n = place(m.vertices, m.normals)
+            glb.write_glb(run_dir / "model.glb", v, m.faces, m.colors, n)
 
     jobs = {"frames": do_frames, "masks": do_masks, "poses": do_poses, "dense": do_dense,
             "mesh": do_mesh}

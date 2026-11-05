@@ -348,3 +348,56 @@ def test_poses_skips_a_setup_whose_features_crash(monkeypatch, tmp_path):
     assert model.folder.name == "sift_global_mapper"
     assert tried[0]["setup"] == "aliked" and "exit -6" in tried[0]["error"]
     assert [t["setup"] for t in tried] == ["aliked", "sift"]  # aliked's second mapper skipped
+
+
+def test_texture_scene_cam_files(tmp_path):
+    from cast.pipeline import texture
+    (tmp_path / "img").mkdir()
+    (tmp_path / "img" / "p1_000001.jpg").write_bytes(b"jpg")
+    cameras = "1 PINHOLE 1000 800 1200 1260 480 410\n"
+    images = "1 1 0 0 0 0.5 -0.25 2 1 p1_000001.jpg\n\n2 1 0 0 0 0 0 0 1 gone.jpg\n\n"
+    assert texture.write_scene(tmp_path / "img", cameras, images, tmp_path / "scene") == 1
+    ext, intr = (tmp_path / "scene" / "p1_000001.cam").read_text().splitlines()
+    assert [float(x) for x in ext.split()] == [0.5, -0.25, 2, 1, 0, 0, 0, 1, 0, 0, 0, 1]
+    assert [float(x) for x in intr.split()] == pytest.approx([1.2, 0, 0, 1.05, 0.48, 0.5125])
+    assert (tmp_path / "scene" / "p1_000001.jpg").read_bytes() == b"jpg"
+
+
+def test_read_obj_splits_corners_with_two_uvs(tmp_path):
+    from cast.pipeline import texture
+    (tmp_path / "t.mtl").write_text("newmtl a\nmap_Kd a.png\nnewmtl b\n")
+    (tmp_path / "t.obj").write_text(
+        "mtllib t.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nvt 0.5 0.5\n"
+        "vn 0 0 1\nusemtl a\nf 1/1/1 2/2/1 3/3/1\nf 2/4/1 4/2/1 3/3/1\nusemtl b\nf 1//1 2//1 4//1\n")
+    (a, uv, f, img), (b, _, fb, none) = texture.read_obj(tmp_path / "t.obj")
+    assert img == tmp_path / "a.png" and none is None
+    assert len(a) == 5  # vertex 2 has two UVs, so it is split
+    assert np.allclose(a[f], [[[0, 0, 0], [1, 0, 0], [0, 1, 0]], [[1, 0, 0], [1, 1, 0], [0, 1, 0]]])
+    assert np.allclose(uv[f[0]], [[0, 1], [1, 1], [0, 0]])  # v flipped to top-left origin
+    assert len(b) == 3 and fb.shape == (1, 3)
+
+
+def test_textured_glb_layout(tmp_path):
+    import json as _json
+    import struct
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], float)
+    png = b"\x89PNG\r\n\x1a\nfake"
+    parts = [(v, np.tile([0, 0, 1.0], (3, 1)), np.zeros((3, 2)), np.array([[0, 1, 2]]), png),
+             (v, None, None, np.array([[0, 1, 2]]), None)]
+    glb.write_textured_glb(tmp_path / "t.glb", parts)
+    raw = (tmp_path / "t.glb").read_bytes()
+    n = struct.unpack("<I", raw[12:16])[0]
+    doc = _json.loads(raw[20:20 + n])
+    p0, p1 = doc["meshes"][0]["primitives"]
+    assert "TEXCOORD_0" in p0["attributes"] and "TEXCOORD_0" not in p1["attributes"]
+    assert doc["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"] == {"index": 0}
+    assert doc["images"][0]["mimeType"] == "image/png"
+    assert struct.unpack("<I", raw[:4])[0] == 0x46546C67 and len(raw) % 4 == 0
+
+
+def test_placement_is_shared_by_parts():
+    v = np.array([[0, 0, 0], [2, 0, 0], [0, 1, 0]], float)
+    place = mesh.placement(v, np.zeros(3), np.array([0, 1.0, 0]))
+    whole, _ = place(v, np.zeros((3, 3)))
+    part, _ = place(v[1:], np.zeros((2, 3)))
+    assert np.allclose(whole[1:], part) and np.ptp(whole, axis=0).max() == pytest.approx(mesh.SIZE)
