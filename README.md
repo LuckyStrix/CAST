@@ -37,6 +37,8 @@ Needs a Linux machine with Docker (a GPU becomes necessary in Phase 2) and a Tai
 
 Phones: Safari on iPhone (iOS 16+) or Chrome on Android.
 
+To update later: `git pull`, then `docker compose up -d --build` (on Windows: `powershell -File docker\update.ps1`).
+
 ## Develop
 
 ```sh
