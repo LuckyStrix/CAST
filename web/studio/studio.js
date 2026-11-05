@@ -80,6 +80,7 @@ async function showProject(id) {
     if (c.meta.phone && c.meta.phone.sensor === false) notes.push("no motion sensor");
     const r = c.meta.report;
     if (r && r.poses) notes.push(`placed ${r.poses.placed}/${r.poses.frames} frames`);
+    if (r && r.poses && "joined" in r.poses) notes.push(r.poses.joined ? "sides joined" : "sides NOT joined");
     if (r && r.seconds) notes.push(`${Math.round(Object.values(r.seconds).reduce((a, b) => a + b, 0) / 60)} min`);
     if (c.error) notes.push(c.error);
     const hasVideo = !["uploading", "cancelled", "abandoned"].includes(c.status);

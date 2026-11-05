@@ -15,7 +15,9 @@ import numpy as np
 from cast.pipeline import PipelineError
 
 MODEL = "birefnet-general-lite"
-ERODE_PX_PER_1000 = 3  # pull the edge in: edge pixels are part background
+# How far to move the mask edge, as a fraction of the image's long side.
+GROW_FOR_POSES = 0.015  # out: keep the object's edges and corners, where joining features are
+GROW_FOR_FUSION = -0.003  # in: edge pixels are part background
 
 
 @functools.cache
@@ -33,7 +35,7 @@ def session():
         raise PipelineError(f"The masking model could not be loaded: {e}") from None
 
 
-def make_masks(images: Path, out: Path, sess=None, progress=None) -> dict:
+def make_masks(images: Path, out: Path, grow: float, sess=None, progress=None) -> dict:
     import cv2
     from PIL import Image
     from rembg import remove
@@ -45,8 +47,9 @@ def make_masks(images: Path, out: Path, sess=None, progress=None) -> dict:
     for i, path in enumerate(paths, 1):
         im = Image.open(path).convert("RGB")
         mask = np.asarray(remove(im, session=sess, only_mask=True).convert("L")) > 127
-        k = max(1, round(ERODE_PX_PER_1000 * max(im.size) / 1000))
-        mask = cv2.erode(mask.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
+        k = max(1, round(abs(grow) * max(im.size)))
+        shift = cv2.dilate if grow > 0 else cv2.erode
+        mask = shift(mask.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
         Image.fromarray((mask * 255).astype(np.uint8)).save(out / (path.name + ".png"))
         coverage.append(float(mask.mean()))
         if progress:

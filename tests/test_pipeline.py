@@ -192,3 +192,35 @@ def test_colmap_progress_lines():
     assert line_fraction("Registering image #12 (30)", total_images=60) == 0.5
     assert line_fraction("Registering image #12 (30)") is None
     assert line_fraction("nothing here") is None
+
+
+def test_crop_cameras_moves_principal_point_and_points():
+    cams = "# c\n1 PINHOLE 3200 1800 2500.0 2500.0 1600.0 900.0\n"
+    imgs = ("# i\n"
+            "1 1 0 0 0 0 0 0 1 p1_000001.jpg\n100.0 200.0 7 1700.5 950.25 -1\n"
+            "2 1 0 0 0 0 0 0 1 p1_000002.jpg\n")
+    c, i = colmap.crop_cameras(cams, imgs, {"p1_000001.jpg": (1000, 500, 2200, 1400)})
+    c_lines, i_lines = c.splitlines(), i.splitlines()
+    assert c_lines[0] == "1 PINHOLE 1200 900 2500.0 2500.0 600.0 400.0"
+    assert c_lines[1] == "2 PINHOLE 3200 1800 2500.0 2500.0 1600.0 900.0"  # no box: whole
+    assert i_lines[0].split()[8] == "1" and i_lines[2].split()[8] == "2"  # own camera each
+    assert i_lines[1].split() == ["-900.0", "-300.0", "7", "700.5", "450.25", "-1"]
+    assert i_lines[3] == ""
+
+
+def test_mask_box():
+    m = np.zeros((1000, 2000), np.uint8)
+    m[400:600, 900:1100] = 255
+    assert colmap.mask_box(m, 0.1, 100) == (880, 380, 1119, 619)  # object 900..1099 + 19.9
+    assert colmap.mask_box(m, 0.1, 300) is None  # too small: keep the whole image
+    assert colmap.mask_box(np.zeros((10, 10), np.uint8), 0.1, 1) is None
+
+
+def test_pass_overlap_counts_shared_points():
+    images = ("1 1 0 0 0 0 0 0 1 p1_000001.jpg\n\n2 1 0 0 0 0 0 0 1 p1_000002.jpg\n\n"
+              "3 1 0 0 0 0 0 0 1 p2_000001.jpg\n\n")
+    points = ("# id x y z r g b err track\n"
+              "1 0 0 0 0 0 0 0.5 1 0 2 0\n"  # side 1 only
+              "2 0 0 0 0 0 0 0.5 1 1 3 4\n"  # both sides
+              "3 0 0 0 0 0 0 0.5 3 9\n")  # side 2 only
+    assert colmap.pass_overlap(images, points) == {"shared": 1, "p1": 1, "p2": 1}

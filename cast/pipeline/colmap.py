@@ -105,6 +105,7 @@ class Model:
     forwards: np.ndarray  # (N, 3) viewing directions (world)
     points: int
     error: float
+    overlap: dict  # 3D points by which passes saw them: {"p1": n, "p2": n, "shared": n}
 
 
 def quat_to_rot(qw, qx, qy, qz) -> np.ndarray:
@@ -132,18 +133,43 @@ def parse_images_txt(text: str):
     return names, np.array(centres), np.array(ups), np.array(fwds)
 
 
+def pass_overlap(images_text: str, points_text: str) -> dict:
+    """How many 3D points each pass saw alone, and how many were seen from both ("shared").
+
+    This is the real test of whether two passes joined: frames can all get a position while
+    the two sides' positions only rest on a few (possibly wrong) common points."""
+    lines = [ln for ln in images_text.splitlines() if not ln.startswith("#")]
+    side = {}
+    for header in lines[0::2]:
+        tok = header.split()
+        if len(tok) >= 10:
+            side[tok[0]] = tok[9].split("_")[0]
+    out = {"shared": 0}
+    for ln in points_text.splitlines():
+        if not ln or ln.startswith("#"):
+            continue
+        seen = {side.get(i) for i in ln.split()[8::2]} - {None}
+        key = "shared" if len(seen) > 1 else next(iter(seen), None)
+        if key:
+            out[key] = out.get(key, 0) + 1
+    return out
+
+
 def read_model(folder: Path, log: Path) -> Model:
     txt = folder.parent / (folder.name + "_txt")
     shutil.rmtree(txt, ignore_errors=True)
     txt.mkdir()
     run("model_converter", ["--input_path", folder, "--output_path", txt, "--output_type", "TXT"],
         log)
-    names, centres, ups, fwds = parse_images_txt((txt / "images.txt").read_text(errors="replace"))
-    errs = [float(ln.split()[7]) for ln in (txt / "points3D.txt").read_text().splitlines()
+    images_text = (txt / "images.txt").read_text(errors="replace")
+    points_text = (txt / "points3D.txt").read_text(errors="replace")
+    names, centres, ups, fwds = parse_images_txt(images_text)
+    errs = [float(ln.split()[7]) for ln in points_text.splitlines()
             if ln and not ln.startswith("#")]
     shutil.rmtree(txt)
     return Model(folder, names, centres, ups, fwds, len(errs),
-                 float(np.mean(errs)) if errs else float("nan"))
+                 float(np.mean(errs)) if errs else float("nan"),
+                 pass_overlap(images_text, points_text))
 
 
 def largest(sparse: Path, log: Path) -> Model | None:
@@ -207,19 +233,107 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path,
     return best, secs
 
 
-def dense(images: Path, model_dir: Path, work: Path, log: Path, max_size: int = 1600,
-          progress=None) -> dict:
-    """Undistort and compute a depth map per frame (GPU). Returns timings."""
+def undistort(images: Path, model_dir: Path, work: Path, log: Path, max_size: int,
+              progress=None) -> float:
     shutil.rmtree(work, ignore_errors=True)
-    secs = {"undistort": run("image_undistorter", [
+    return run("image_undistorter", [
         "--image_path", images, "--input_path", model_dir, "--output_path", work,
-        "--output_type", "COLMAP", "--max_image_size", max_size], log, span(progress, 0, 0.05))}
-    secs["stereo"] = run("patch_match_stereo", [
+        "--output_type", "COLMAP", "--max_image_size", max_size], log, progress)
+
+
+def crop_cameras(cameras_text: str, images_text: str, boxes: dict) -> tuple[str, str]:
+    """Rewrite an undistorted (PINHOLE) model so each image has its own camera cropped to
+    `boxes[name] = (x0, y0, x1, y1)`: size from the box, principal point moved by its corner,
+    2D observations moved likewise. Images without a box keep their full frame."""
+    cams = {}
+    for ln in cameras_text.splitlines():
+        if ln and not ln.startswith("#"):
+            t = ln.split()
+            if t[1] != "PINHOLE":
+                raise RuntimeError(f"undistorted camera model is {t[1]}, expected PINHOLE")
+            cams[t[0]] = [float(v) for v in t[2:8]]  # w h fx fy cx cy
+    lines = [ln for ln in images_text.splitlines() if not ln.startswith("#")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if len(lines) % 2:
+        lines.append("")  # the last image's (empty) observation line
+    out_cams, out_images = [], []
+    for header, pts in zip(lines[0::2], lines[1::2]):
+        t = header.split()
+        image_id, name = t[0], " ".join(t[9:])
+        w, h, fx, fy, cx, cy = cams[t[8]]
+        x0, y0, x1, y1 = boxes.get(name, (0, 0, int(w), int(h)))
+        out_cams.append(f"{image_id} PINHOLE {x1 - x0} {y1 - y0} {fx!r} {fy!r} "
+                        f"{cx - x0!r} {cy - y0!r}")
+        t[8] = image_id
+        out_images.append(" ".join(t))
+        p = pts.split()
+        for i in range(0, len(p) - 2, 3):  # x y point3D_id
+            p[i], p[i + 1] = repr(float(p[i]) - x0), repr(float(p[i + 1]) - y0)
+        out_images.append(" ".join(p))
+    return "\n".join(out_cams) + "\n", "\n".join(out_images) + "\n"
+
+
+def mask_box(mask, margin: float, min_side: int):
+    """(x0, y0, x1, y1) round the mask's object plus a margin, or None when there is no
+    object or the box would be too small to be useful."""
+    if mask is None or not mask.any():
+        return None
+    h, w = mask.shape
+    ys, xs = np.nonzero(mask)
+    pad = margin * max(xs.max() - xs.min(), ys.max() - ys.min())
+    x0, y0 = max(0, int(xs.min() - pad)), max(0, int(ys.min() - pad))
+    x1, y1 = min(w, int(xs.max() + pad) + 1), min(h, int(ys.max() + pad) + 1)
+    if x1 - x0 < min_side or y1 - y0 < min_side:
+        return None
+    return x0, y0, x1, y1
+
+
+def crop_to_masks(work: Path, mask_dir: Path, log: Path, margin: float = 0.12,
+                  min_side: int = 256) -> dict:
+    """Crop every undistorted image (and its mask) to the object and give each its own camera.
+    Depth maps then spend their pixels on the object, not the table."""
+    import cv2
+
+    boxes, areas = {}, []
+    for img_path in sorted((work / "images").iterdir()):
+        mask_path = mask_dir / (img_path.name + ".png")
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        box = mask_box(mask, margin, min_side)
+        if box is None:
+            areas.append(1.0)
+            continue
+        x0, y0, x1, y1 = box
+        image = cv2.imread(str(img_path))
+        cv2.imwrite(str(img_path), image[y0:y1, x0:x1], [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(str(mask_path), mask[y0:y1, x0:x1])
+        boxes[img_path.name] = box
+        areas.append((x1 - x0) * (y1 - y0) / (mask.shape[0] * mask.shape[1]))
+
+    txt = work / "sparse_txt"
+    shutil.rmtree(txt, ignore_errors=True)
+    txt.mkdir()
+    run("model_converter", ["--input_path", work / "sparse", "--output_path", txt,
+                            "--output_type", "TXT"], log)
+    cameras, images = crop_cameras((txt / "cameras.txt").read_text(),
+                                   (txt / "images.txt").read_text(), boxes)
+    sparse = work / "sparse"
+    for old in sparse.iterdir():
+        old.unlink()
+    (sparse / "cameras.txt").write_text(cameras)
+    (sparse / "images.txt").write_text(images)
+    shutil.copy(txt / "points3D.txt", sparse / "points3D.txt")
+    shutil.rmtree(txt)
+    return {"images": len(areas), "cropped": len(boxes),
+            "median_area_kept": round(float(np.median(areas)), 3) if areas else 1.0}
+
+
+def stereo(work: Path, log: Path, max_size: int = 2000, progress=None) -> float:
+    """A depth and normal map per image (GPU), with geometric consistency (two passes)."""
+    return run("patch_match_stereo", [
         "--workspace_path", work, "--workspace_format", "COLMAP",
-        "--PatchMatchStereo.geom_consistency", "1",
-        "--PatchMatchStereo.window_radius", "4", "--PatchMatchStereo.window_step", "2",
-        "--PatchMatchStereo.num_samples", "10"], log, span(progress, 0.05, 1.0), passes=2)
-    return secs
+        "--PatchMatchStereo.max_image_size", max_size,
+        "--PatchMatchStereo.geom_consistency", "1"], log, progress, passes=2)
 
 
 def fuse(work: Path, out_ply: Path, masks: Path | None, log: Path, progress=None) -> float:

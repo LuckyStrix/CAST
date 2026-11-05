@@ -21,10 +21,12 @@
   "check_surface": "Put it on a plain surface that is a different colour from the object.",
   "check_gloves": "Wear gloves (blue or purple are best) when you turn the object over.",
   "check_space": "Make sure you can walk all the way round it.",
+  "check_close": "Hold the phone close, so the object fills most of the screen.",
   "check_markers": "If you have the printed marker card, put it on the ground next to the object.",
   "start_camera": "Start camera",
 
   "rec_start": "Record",
+  "frame_guide": "Get close: fill this box with the object",
   "rec_hint_object_1": "Walk slowly all the way round. Keep the whole object in view.",
   "rec_hint_object_2": "Walk round again to film the other side.",
   "rec_hint_insitu_1": "Walk slowly all the way round, holding the phone low.",

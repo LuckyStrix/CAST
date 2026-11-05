@@ -78,6 +78,7 @@ function summary(r) {
   if (r.poses) {
     const passes = Object.entries(r.poses.passes).map(([p, v]) => `${p}: ${v.placed}/${v.frames}`).join(", ");
     parts.push(`Frames placed ${r.poses.placed}/${r.poses.frames} (${passes})`);
+    if (r.poses.overlap && "joined" in r.poses) parts.push(`${r.poses.overlap.shared || 0} points seen from both sides: ${r.poses.joined ? "joined" : "NOT joined"}`);
   }
   if (r.mesh) parts.push(`${r.mesh.triangles.toLocaleString()} triangles${r.mesh.open ? ", open where unseen" : ""}`);
   if (r.mesh && !r.mesh.scale_known) parts.push("size not known (no marker card)");

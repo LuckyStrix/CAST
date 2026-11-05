@@ -14,6 +14,12 @@ import numpy as np
 from cast.pipeline import PipelineError, colmap, frames, glb, masks, mesh
 
 STAGES = ["frames", "masks", "poses", "dense", "mesh"]
+# Two passes are joined only if enough 3D points were seen from both. Frames all getting a
+# position proves nothing: the first box run placed 158/160 frames on 42 shared points and
+# its halves were far apart.
+MIN_SHARED_POINTS = 300
+MIN_SHARED_FRACTION = 0.08
+FRAME_SIZE = 3200  # long side of extracted frames: small objects need the pixels
 
 
 def stages_for(mode: str) -> list[str]:
@@ -54,11 +60,11 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
     def do_frames(p):
         markers = meta.get("phone", {}).get("markers", [])
         report["frames"] = frames.make_frames(video, markers, meta["video"]["duration"], mode,
-                                              images, progress=p)
+                                              images, max_size=FRAME_SIZE, progress=p)
         note(f"frames: {report['frames']['frames']} kept")
 
     def do_masks(p):
-        report["masks"] = masks.make_masks(images, mask_dir, progress=p)
+        report["masks"] = masks.make_masks(images, mask_dir, masks.GROW_FOR_POSES, progress=p)
 
     def do_poses(p):
         model, secs = colmap.poses(images, mask_dir if use_masks else None, run_dir / "sfm", log,
@@ -70,6 +76,7 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
                            "placed": sum(n.startswith(k + "_") for n in model.names)}
         report["poses"] = {"placed": len(model.names), "frames": total, "passes": per_pass,
                            "points": model.points, "error_px": round(model.error, 3),
+                           "overlap": model.overlap,
                            "colmap_seconds": {k: round(v) for k, v in secs.items()}}
         state["model"] = str(model.folder)
         state["cameras"] = {"names": model.names, "centres": model.centres.tolist(),
@@ -78,19 +85,35 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
         if len(model.names) < colmap.MIN_REGISTERED * total:
             raise PipelineError(f"Only {len(model.names)} of {total} frames could be placed. "
                                 "Walk slower and keep the whole object in view.")
-        if use_masks and any(p["placed"] < 0.5 * p["frames"] for p in per_pass.values()):
-            raise PipelineError("The two sides could not be joined. Film the edges slowly, "
-                                "before and after turning the object over.")
+        if len(per_pass) > 1:
+            shared = model.overlap.get("shared", 0)
+            joined = (shared >= MIN_SHARED_POINTS and shared >= MIN_SHARED_FRACTION * model.points
+                      and all(p["placed"] >= 0.5 * p["frames"] for p in per_pass.values()))
+            report["poses"]["joined"] = joined
+            note(f"poses: {shared} points seen from both passes -> "
+                 f"{'joined' if joined else 'NOT joined'}")
+            if not joined:
+                raise PipelineError("The two sides could not be joined into one model. Film "
+                                    "the edges slowly, before and after turning the object over, "
+                                    "and keep the object filling the box on screen.")
 
     def do_dense(p):
-        secs = colmap.dense(images, Path(state["model"]), dense_dir, log,
-                            progress=colmap.span(p, 0, 0.85))
+        # Object: undistort at full size, mask, crop each image to the object. In the ground:
+        # the whole scene matters, so whole images at a moderate size.
+        secs = {"undistort": colmap.undistort(images, Path(state["model"]), dense_dir, log,
+                                              FRAME_SIZE if use_masks else 2000,
+                                              colmap.span(p, 0, 0.03))}
         fusion_masks = None
-        if use_masks:  # fusion reads undistorted images, so mask those
+        if use_masks:  # fusion and cropping read the undistorted images, so mask those
             fusion_masks = dense_dir / "masks"
-            masks.make_masks(dense_dir / "images", fusion_masks, progress=colmap.span(p, 0.85, 0.92))
+            t = time.time()
+            masks.make_masks(dense_dir / "images", fusion_masks, masks.GROW_FOR_FUSION,
+                             progress=colmap.span(p, 0.03, 0.1))
+            report["crop"] = colmap.crop_to_masks(dense_dir, fusion_masks, log)
+            secs["masks_and_crop"] = time.time() - t
+        secs["stereo"] = colmap.stereo(dense_dir, log, progress=colmap.span(p, 0.1, 0.95))
         secs["fusion"] = colmap.fuse(dense_dir, cloud, fusion_masks, log,
-                                     progress=colmap.span(p, 0.92, 1.0))
+                                     progress=colmap.span(p, 0.95, 1.0))
         report["dense_seconds"] = {k: round(v) for k, v in secs.items()}
 
     def do_mesh(p):
