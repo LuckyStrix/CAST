@@ -234,14 +234,22 @@ function warn(text, ms = 1200) {
   warnTimer = setTimeout(() => { $("warning").hidden = true; }, ms);
 }
 
+// End of pass 1: a full-screen card in both modes, so the change is obvious and a stray tap
+// can't skip a pass. Object: turn it over. In the ground: walk round again, higher.
 function endPass1() {
   mark("pass1_end");
-  if (mode === "object") {
-    $("flip").hidden = false;
-  } else {
-    startPass2();
-  }
+  const object = mode === "object";
+  $("pass-icon").textContent = object ? "⟲" : "✓";
+  $("pass-icon").className = object ? "flip-anim" : "flip-anim still";
+  $("pass-title").textContent = t(object ? "flip_title" : "pass1_done_title");
+  $("pass-body").textContent = t(object ? "flip_body" : "pass1_done_body");
+  $("flip-done").textContent = t(object ? "flip_done" : "pass2_go");
+  $("pass-finish").hidden = object; // in the ground, one loop can be enough
+  $("round-done").hidden = true;
+  $("flip").hidden = false;
 }
+
+$("pass-finish").addEventListener("click", stopRecording);
 
 // After a pass changes, hide "gone all the way round" briefly: a double tap must not skip a pass.
 function pauseRoundButton() {
