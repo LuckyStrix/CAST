@@ -57,24 +57,30 @@ export class TurnTracker {
 }
 
 // --- Picture quality ------------------------------------------------------------------------
-// Every half second, a small copy of the frame: mean brightness and edge strength (variance of
-// the Laplacian). Sharpness is judged against the best recent value, since the right number
-// depends on the object.
+// Every half second, the centre of the frame (where the object is): mean brightness and edge
+// strength (variance of the Laplacian). Sharpness is compared with the typical value of the last
+// few seconds, since the right number depends on the object. Only sustained blur is reported:
+// the server keeps the sharpest frames, so a moment of shake costs nothing.
+
+const WINDOW = 12; // measurements (6 s) that set the typical sharpness
+const SUSTAIN = 4; // blurry measurements in a row (2 s) before warning
 
 export class QualityCheck {
   constructor(video) {
     this.video = video;
     this.canvas = document.createElement("canvas");
-    this.canvas.width = 160; this.canvas.height = 120;
+    this.canvas.width = 192; this.canvas.height = 144;
     this.ctx = this.canvas.getContext("2d", { willReadFrequently: true });
-    this.best = 0;
+    this.recent = [];
+    this.streak = 0;
   }
 
   measure() {
     const v = this.video;
     if (!v.videoWidth) return null;
     const { width: w, height: h } = this.canvas;
-    this.ctx.drawImage(v, 0, 0, w, h);
+    // middle half of the picture in each direction
+    this.ctx.drawImage(v, v.videoWidth / 4, v.videoHeight / 4, v.videoWidth / 2, v.videoHeight / 2, 0, 0, w, h);
     const px = this.ctx.getImageData(0, 0, w, h).data;
     const lum = new Float32Array(w * h);
     let sum = 0;
@@ -91,7 +97,12 @@ export class QualityCheck {
       }
     }
     const sharp = s2 / n - (s / n) ** 2;
-    this.best = Math.max(sharp, this.best * 0.995); // slowly forget, so a new scene can set its own level
-    return { brightness: sum / (w * h), sharp, blurry: sharp < 0.35 * this.best };
+    this.recent.push(sharp);
+    if (this.recent.length > WINDOW) this.recent.shift();
+    const sorted = [...this.recent].sort((a, b) => a - b);
+    const typical = sorted[Math.floor(sorted.length / 2)];
+    const soft = this.recent.length >= 4 && sharp < 0.4 * typical;
+    this.streak = soft ? this.streak + 1 : 0;
+    return { brightness: sum / (w * h), sharp, blurry: this.streak >= SUSTAIN };
   }
 }
