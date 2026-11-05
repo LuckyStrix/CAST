@@ -2,8 +2,25 @@
 // and whether the picture is too dark or blurry. Works without sensors, just with less help.
 
 // --- Turn tracking --------------------------------------------------------------------------
-// Turning about the vertical axis = gyroscope rate projected on gravity. This works whatever way
-// the phone is held, unlike the compass-style `alpha` angle.
+// How far round the object you have walked = how far the camera's facing direction has turned,
+// seen from above. That direction comes from the phone's orientation (deviceorientation), so
+// it does not depend on how a browser labels gyroscope axes (Safari's labelling made a summed
+// gyroscope rate read about half the true turn) and it does not drift.
+
+const DEG = Math.PI / 180;
+
+// Compass direction (degrees) the camera looks along, or null when it points nearly straight
+// down or up. W3C device orientation: R = Rz(alpha) Rx(beta) Ry(gamma); the camera looks along
+// the device's -z axis, i.e. minus the third column of R.
+export function cameraHeading(alpha, beta, gamma) {
+  const cA = Math.cos(alpha * DEG), sA = Math.sin(alpha * DEG);
+  const cB = Math.cos(beta * DEG), sB = Math.sin(beta * DEG);
+  const cG = Math.cos(gamma * DEG), sG = Math.sin(gamma * DEG);
+  const fx = -(cG * sA * sB + cA * sG);
+  const fy = -(sA * sG - cA * cG * sB);
+  if (Math.hypot(fx, fy) < 0.25) return null; // looking almost straight down: direction unclear
+  return Math.atan2(fx, fy) / DEG;
+}
 
 export class TurnTracker {
   constructor() {
@@ -11,46 +28,48 @@ export class TurnTracker {
     this.rate = 0; // smoothed degrees per second
     this.samples = []; // [t seconds, heading degrees] at ~4 Hz, kept in the capture's metadata
     this.hasSensor = false;
-    this.last = null;
+    this.heading = 0; // unwrapped, since begin()
+    this.lastDir = null;
+    this.lastT = null;
     this.t0 = performance.now();
-    this.handler = (e) => this.onMotion(e);
+    this.handler = (e) => this.onOrientation(e);
   }
 
   // Must be called from a tap on iOS (permission prompt).
   async start() {
     try {
-      if (typeof DeviceMotionEvent !== "undefined" && DeviceMotionEvent.requestPermission) {
-        if ((await DeviceMotionEvent.requestPermission()) !== "granted") return false;
+      for (const Ev of [window.DeviceOrientationEvent, window.DeviceMotionEvent]) {
+        if (Ev && Ev.requestPermission && (await Ev.requestPermission()) !== "granted") return false;
       }
     } catch { return false; }
-    window.addEventListener("devicemotion", this.handler);
+    window.addEventListener("deviceorientation", this.handler);
     return true;
   }
 
-  stop() { window.removeEventListener("devicemotion", this.handler); }
+  stop() { window.removeEventListener("deviceorientation", this.handler); }
 
   reset() { this.total = 0; }
 
   begin() { this.t0 = performance.now(); this.samples = []; this.heading = 0; this.total = 0; }
 
-  onMotion(e) {
-    const r = e.rotationRate, g = e.accelerationIncludingGravity;
-    if (!r || !g || r.alpha == null || g.x == null) return;
-    const now = performance.now();
-    const len = Math.hypot(g.x, g.y, g.z) || 1;
-    // rotationRate: alpha about z, beta about x, gamma about y (degrees per second)
-    const yaw = (r.beta * g.x + r.gamma * g.y + r.alpha * g.z) / len;
-    if (this.last != null) {
-      const dt = Math.min((now - this.last) / 1000, 0.2);
-      this.total += yaw * dt;
-      this.heading = (this.heading || 0) + yaw * dt;
-      this.rate = 0.9 * this.rate + 0.1 * Math.abs(yaw);
-    }
-    this.last = now;
+  onOrientation(e) {
+    if (e.alpha == null || e.beta == null || e.gamma == null) return;
     this.hasSensor = true;
+    const now = performance.now();
+    const dir = cameraHeading(e.alpha, e.beta, e.gamma);
+    if (dir == null) { this.lastDir = null; return; }
+    if (this.lastDir != null) {
+      const d = ((dir - this.lastDir + 540) % 360) - 180; // shortest way round
+      this.total += d;
+      this.heading += d;
+      const dt = (now - this.lastT) / 1000;
+      if (dt > 0) this.rate = 0.9 * this.rate + 0.1 * Math.min(Math.abs(d) / dt, 360);
+    }
+    this.lastDir = dir;
+    this.lastT = now;
     const t = (now - this.t0) / 1000;
     const prev = this.samples[this.samples.length - 1];
-    if (!prev || t - prev[0] >= 0.25) this.samples.push([+t.toFixed(2), Math.round(this.heading || 0)]);
+    if (!prev || t - prev[0] >= 0.25) this.samples.push([+t.toFixed(2), Math.round(this.heading)]);
   }
 
   fraction() { return Math.min(1, Math.abs(this.total) / 360); }
