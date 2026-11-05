@@ -153,7 +153,11 @@ $("rec").addEventListener("click", async () => {
   let n = 0, size = 0, buf = new Blob([]), saving = Promise.resolve();
   const save = (blob) => {
     const i = n++;
-    saving = saving.then(() => store.putChunk(recording.id, i, blob)).then(() => uploader.kick());
+    // Store a copy of the bytes, not the slice: Safari can persist a whole file-backed blob when
+    // asked to store a slice of it, which made one piece far bigger than 4 MB.
+    saving = saving
+      .then(async () => store.putChunk(recording.id, i, await blob.arrayBuffer()))
+      .then(() => uploader.kick());
   };
   recorder.ondataavailable = (e) => {
     if (!e.data || !e.data.size) return;
@@ -190,7 +194,12 @@ $("rec").addEventListener("click", async () => {
 });
 
 function elapsed() { return (performance.now() - startedAt) / 1000; }
-function mark(event) { recording.meta.markers.push({ t: +elapsed().toFixed(2), event }); }
+function mark(event) {
+  // `turned`: degrees the motion sensor measured this pass, to check the ring against reality
+  const m = { t: +elapsed().toFixed(2), event };
+  if (turn.hasSensor) m.turned = Math.round(Math.abs(turn.total));
+  recording.meta.markers.push(m);
+}
 
 function tick() {
   const sec = elapsed();
@@ -247,7 +256,8 @@ function startPass2() {
 $("flip-done").addEventListener("click", startPass2);
 
 $("round-done").addEventListener("click", () => {
-  if (turn.hasSensor && turn.fraction() < 0.75 && !confirm(t("warn_early"))) return;
+  // Trust the person over the sensor. (A confirm() here froze the page while recording went on.)
+  mark("round_button");
   if (pass === 1) endPass1();
   else { $("finish").hidden = false; $("round-done").hidden = true; $("hint").textContent = t("all_done"); }
 });

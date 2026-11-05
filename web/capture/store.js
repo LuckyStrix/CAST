@@ -2,7 +2,8 @@
 // connection or a capture made offline loses nothing.
 //
 // captures: {id, token, mode, mime, device, total (null while recording), meta, created, created_on_server}
-// chunks:   {id, n, blob}, key [id, n]
+// chunks:   {id, n, data (ArrayBuffer)}, key [id, n]
+// A capture the server refused as too large keeps its data and gets `failed` (not retried).
 
 const DB_NAME = "cast";
 let dbp = null;
@@ -43,7 +44,7 @@ export const store = {
     r.onsuccess = () => { if (r.result) s.put({ ...r.result, ...fields }); };
   }),
   allCaptures: () => tx("captures", "readonly", (s) => s.getAll()),
-  putChunk: (id, n, blob) => tx("chunks", "readwrite", (s) => s.put({ id, n, blob })),
+  putChunk: (id, n, data) => tx("chunks", "readwrite", (s) => s.put({ id, n, data })),
   chunkKeys: (id) => tx("chunks", "readonly", (s) => s.index("by_id").getAllKeys(IDBKeyRange.only(id))),
   getChunk: (id, n) => tx("chunks", "readonly", (s) => s.get([id, n])),
   delChunk: (id, n) => tx("chunks", "readwrite", (s) => s.delete([id, n])),
@@ -96,7 +97,7 @@ export class Uploader {
   async run() {
     let delay = 2000;
     for (;;) {
-      const caps = (await store.allCaptures()).sort((a, b) => a.created - b.created);
+      const caps = (await store.allCaptures()).filter((c) => !c.failed).sort((a, b) => a.created - b.created);
       if (!caps.length) return;
       let progressed = false;
       try {
@@ -105,10 +106,12 @@ export class Uploader {
         delay = 2000;
       } catch (e) {
         if (e instanceof HttpError && e.status >= 400 && e.status < 500 && e.status !== 409 && e.status !== 429) {
-          // The server will never accept this one (bad link, used up, too large). Give up on it.
+          // The server will never accept this one (bad link, used up, stopped, too large).
           const c = caps.find((x) => x.id === this.current);
           if (c) {
-            await store.delCapture(c.id);
+            // Too large: keep the recording on the phone, it may be recoverable. Otherwise drop it.
+            if (e.status === 413) await store.patchCapture(c.id, { failed: e.message });
+            else await store.delCapture(c.id);
             this.onProgress({ id: c.id, state: "failed", error: e.message });
           }
           continue;
@@ -135,8 +138,8 @@ export class Uploader {
     let progressed = false;
     for (const n of keys) {
       if (!have.has(n)) {
-        const { blob } = await store.getChunk(c.id, n);
-        await api("PUT", `${base}/${c.id}/chunks/${n}`, blob, false);
+        const piece = await store.getChunk(c.id, n);
+        await api("PUT", `${base}/${c.id}/chunks/${n}`, piece.data, false);
       }
       await store.delChunk(c.id, n);
       progressed = true;

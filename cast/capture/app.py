@@ -6,6 +6,7 @@ admin routes and reads nothing back except a capture's own upload status.
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import time
@@ -20,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from cast.common import config, db
 from cast.common.web import RateLimit, add_security_headers, client_ip
 
+log = logging.getLogger("uvicorn.error")
 MAX_META_BYTES = 64 * 1024
 
 per_ip = RateLimit(count=900, seconds=60)  # ~15 requests/s: chunks plus status polls
@@ -177,7 +179,8 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
         async for piece in request.stream():
             data += piece
             if len(data) > cfg.chunk_bytes:
-                raise HTTPException(413, "chunk too large")
+                log.warning("capture %s chunk %d over %d bytes", cid, n, cfg.chunk_bytes)
+                raise HTTPException(413, f"piece {n} is over {cfg.chunk_bytes} bytes")
         async with locks.setdefault(cid, asyncio.Lock()):
             with db.connect(cfg.db) as con:
                 cap = capture_or_404(con, token, cid)
@@ -187,7 +190,8 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
                 path = chunk_dir(cid) / f"{n:06d}.part"
                 old = path.stat().st_size if path.exists() else 0
                 if cap["bytes"] - old + len(data) > cfg.max_capture_bytes:
-                    raise HTTPException(413, "capture too large")
+                    log.warning("capture %s over the %d byte limit", cid, cfg.max_capture_bytes)
+                    raise HTTPException(413, "The recording is too large.")
                 await run_in_threadpool(write_chunk, path, bytes(data))
                 con.execute(
                     "UPDATE captures SET bytes = bytes - ? + ?, updated = ? WHERE id = ?",
