@@ -29,3 +29,5 @@ tbody tr.link:hover { background: color-mix(in srgb, var(--accent) 10%, transpar
 .invite code { word-break: break-all; }
 .invite.off { opacity: .5; }
 .wrap { overflow-x: auto; }
+.pbar { height: 8px; width: 10rem; max-width: 100%; background: var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0; }
+.pbar > div { height: 100%; background: var(--ok); transition: width .5s; }

@@ -77,7 +77,7 @@ def extract(video: Path, start: float, end: float, count: int, max_size: int, ou
 
 
 def make_frames(video: Path, markers: list, duration: float, mode: str, out: Path,
-                total: int = 160, max_size: int = 1600) -> dict:
+                total: int = 160, max_size: int = 1600, progress=None) -> dict:
     """Fill `out` with the chosen frames. Returns numbers for the report."""
     segs = passes(markers, duration, mode)
     if not segs:
@@ -86,12 +86,20 @@ def make_frames(video: Path, markers: list, duration: float, mode: str, out: Pat
         shutil.rmtree(out)
     out.mkdir(parents=True)
     report = {"passes": []}
+    span = sum(b - a for _, a, b in segs)
+    done = 0.0
     for (k, a, b), count in zip(segs, split_count(segs, total)):
         scratch = out.parent / f"candidates_{k}"
         if scratch.exists():
             shutil.rmtree(scratch)
         cands = extract(video, a, b, count * CANDIDATES_PER_FRAME, max_size, scratch)
+        share = (b - a) / span
+        if progress:
+            progress(done + 0.6 * share)  # decoding is most of the time
         scores = [sharpness(p) for p in cands]
+        done += share
+        if progress:
+            progress(done)
         keep = select_sharpest(scores, count)
         for n, i in enumerate(keep, 1):
             shutil.copyfile(cands[i], out / f"p{k}_{n:06d}.jpg")

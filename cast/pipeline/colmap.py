@@ -4,6 +4,7 @@ Checked against COLMAP 4.2.1 (colmap/colmap image). Option names that changed be
 are looked up in the command's own help. Pose reading and pair lists come from FleshForge.
 """
 
+import re
 import shutil
 import subprocess
 import time
@@ -25,13 +26,48 @@ def available() -> bool:
     return shutil.which("colmap") is not None
 
 
-def run(command: str, args: list, log: Path) -> float:
+_COUNT = re.compile(r"\[(\d+)/(\d+)\]")  # "Processed file [12/160]", "Fusing image [3/160]"
+_BLOCK = re.compile(r"\[(\d+)/(\d+), (\d+)/(\d+)\]")  # exhaustive "Matching block [1/4, 2/4]"
+_VIEW = re.compile(r"Processing view (\d+) / (\d+)")  # patch_match_stereo
+_REGISTER = re.compile(r"Registering image #\d+ \((\d+)\)")  # incremental mapper
+
+
+def line_fraction(line: str, total_images: int = 0) -> float | None:
+    """How far a COLMAP command is, from one line of its output, or None."""
+    if m := _BLOCK.search(line):
+        a, b, c, d = map(int, m.groups())
+        return ((a - 1) * d + c) / (b * d)
+    if m := _VIEW.search(line):
+        return int(m.group(1)) / int(m.group(2))
+    if m := _COUNT.search(line):
+        return int(m.group(1)) / int(m.group(2))
+    if total_images and (m := _REGISTER.search(line)):
+        return min(1.0, int(m.group(1)) / total_images)
+    return None
+
+
+def run(command: str, args: list, log: Path, progress=None, total_images: int = 0,
+        passes: int = 1) -> float:
+    """Run `colmap command args`, appending its output to `log`. `progress(fraction)` is called
+    as COLMAP reports how far it is. `passes`: how many times the command goes through every
+    image (patch_match_stereo with geometric consistency: 2)."""
     cmd = ["colmap", command, *[str(a) for a in args]]
     start = time.time()
+    done_passes, last = 0, 0.0
     with open(log, "a", encoding="utf-8", errors="replace") as fh:
         fh.write(f"\n===== {' '.join(cmd)}\n")
         fh.flush()
-        code = subprocess.run(cmd, check=False, stdout=fh, stderr=subprocess.STDOUT).returncode
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                errors="replace", bufsize=1)
+        for line in proc.stdout:
+            fh.write(line)
+            f = line_fraction(line, total_images) if progress else None
+            if f is not None:
+                if f + 0.5 < last and done_passes + 1 < passes:  # counting started over
+                    done_passes += 1
+                last = f
+                progress(min(1.0, (done_passes + f) / passes))
+        code = proc.wait()
     if code != 0:
         tail = "\n".join(log.read_text(errors="replace").splitlines()[-8:])
         raise RuntimeError(f"colmap {command} failed (exit {code}):\n{tail}")
@@ -116,7 +152,13 @@ def largest(sparse: Path, log: Path) -> Model | None:
     return max(models, key=lambda m: len(m.names)) if models else None
 
 
-def poses(images: Path, masks: Path | None, work: Path, log: Path) -> tuple[Model, dict]:
+def span(progress, lo: float, hi: float):
+    """A progress callback for one part (lo..hi) of a stage."""
+    return (lambda f: progress(lo + (hi - lo) * f)) if progress else None
+
+
+def poses(images: Path, masks: Path | None, work: Path, log: Path,
+          progress=None) -> tuple[Model, dict]:
     """Features, matching, mapping. Returns the model with the most frames, and timings."""
     work.mkdir(parents=True, exist_ok=True)
     db = work / "database.db"
@@ -131,7 +173,7 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path) -> tuple[Mode
             "1"]
     if masks is not None:
         args += ["--ImageReader.mask_path", masks]
-    secs["features"] = run("feature_extractor", args, log)
+    secs["features"] = run("feature_extractor", args, log, span(progress, 0, 0.2))
 
     if len(names) <= EXHAUSTIVE_MAX:
         matcher, margs = "exhaustive_matcher", []
@@ -140,7 +182,8 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path) -> tuple[Mode
         pairs.write_text("".join(f"{a} {b}\n" for a, b in match_pairs(names)))
         matcher, margs = "matches_importer", ["--match_list_path", pairs, "--match_type", "pairs"]
     gpu = option(matcher, "--FeatureMatching.use_gpu", "--SiftMatching.use_gpu")
-    secs["matching"] = run(matcher, ["--database_path", db, gpu, "1", *margs], log)
+    secs["matching"] = run(matcher, ["--database_path", db, gpu, "1", *margs], log,
+                           span(progress, 0.2, 0.55))
 
     best = None
     for mapper in ("global_mapper", "mapper"):  # global first (fast); incremental if it falls short
@@ -149,7 +192,8 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path) -> tuple[Mode
         out.mkdir()
         try:
             secs[mapper] = run(mapper, ["--database_path", db, "--image_path", images,
-                                        "--output_path", out], log)
+                                        "--output_path", out], log,
+                               span(progress, 0.55, 1.0), total_images=len(names))
             model = largest(out, log)
         except RuntimeError:
             model = None
@@ -163,23 +207,24 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path) -> tuple[Mode
     return best, secs
 
 
-def dense(images: Path, model_dir: Path, work: Path, log: Path, max_size: int = 1600) -> dict:
+def dense(images: Path, model_dir: Path, work: Path, log: Path, max_size: int = 1600,
+          progress=None) -> dict:
     """Undistort and compute a depth map per frame (GPU). Returns timings."""
     shutil.rmtree(work, ignore_errors=True)
     secs = {"undistort": run("image_undistorter", [
         "--image_path", images, "--input_path", model_dir, "--output_path", work,
-        "--output_type", "COLMAP", "--max_image_size", max_size], log)}
+        "--output_type", "COLMAP", "--max_image_size", max_size], log, span(progress, 0, 0.05))}
     secs["stereo"] = run("patch_match_stereo", [
         "--workspace_path", work, "--workspace_format", "COLMAP",
         "--PatchMatchStereo.geom_consistency", "1",
         "--PatchMatchStereo.window_radius", "4", "--PatchMatchStereo.window_step", "2",
-        "--PatchMatchStereo.num_samples", "10"], log)
+        "--PatchMatchStereo.num_samples", "10"], log, span(progress, 0.05, 1.0), passes=2)
     return secs
 
 
-def fuse(work: Path, out_ply: Path, masks: Path | None, log: Path) -> float:
+def fuse(work: Path, out_ply: Path, masks: Path | None, log: Path, progress=None) -> float:
     args = ["--workspace_path", work, "--workspace_format", "COLMAP",
             "--input_type", "geometric", "--output_path", out_ply]
     if masks is not None:
         args += ["--StereoFusion.mask_path", masks]
-    return run("stereo_fusion", args, log)
+    return run("stereo_fusion", args, log, progress)

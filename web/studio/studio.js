@@ -86,20 +86,35 @@ async function showProject(id) {
     const bad = ["rejected", "failed"].includes(c.status);
     return el("tr", {},
       el("td", {}, when(c.created)), el("td", {}, c.mode),
-      el("td", { class: bad ? "bad" : c.status === "done" ? "ok" : "" },
-        c.status === "processing" ? `processing: ${c.stage || "starting"}` : c.status === "checked" ? "waiting for GPU" : c.status),
+      el("td", { class: bad ? "bad" : c.status === "done" ? "ok" : "" }, ...statusCell(c)),
       el("td", {}, hasVideo ? el("a", { href: `/api/captures/${c.id}/video`, target: "_blank" }, "play") : ""),
       el("td", {}, ...modelCell(c)),
       el("td", { class: "muted" }, notes.join(" · ")));
   }));
 }
 
+function minutes(s) { return s < 90 ? "under 2 min" : `about ${Math.round(s / 60)} min`; }
+
+function statusCell(c) {
+  if (c.status === "checked") return ["waiting for GPU"];
+  if (c.status !== "processing") return [c.status];
+  const p = c.progress || {};
+  const pct = Math.round((p.fraction || 0) * 100);
+  return [
+    `${p.stage || "starting"} · ${pct}%`,
+    el("div", { class: "pbar" }, el("div", { style: `width:${pct}%` })),
+    el("span", { class: "muted" }, p.eta_seconds != null ? `${minutes(p.eta_seconds)} left` : ""),
+  ];
+}
+
 function modelCell(c) {
   const retry = (label) => el("button", { class: "plain", onclick: async () => {
     await api("POST", `/api/captures/${c.id}/retry`); showProject(current);
   } }, label);
-  if (c.status === "done") return [el("a", { href: `/view?c=${c.id}`, target: "_blank" }, "view 3D"), " ", retry("redo")];
-  if (c.status === "failed") return [retry("retry")];
+  const log = el("a", { href: `/view-log?c=${c.id}`, target: "_blank" }, "log");
+  if (c.status === "done") return [el("a", { href: `/view?c=${c.id}`, target: "_blank" }, "view 3D"), " ", log, " ", retry("redo")];
+  if (c.status === "failed") return [log, " ", retry("retry")];
+  if (c.status === "processing") return [log];
   return [];
 }
 
@@ -129,4 +144,4 @@ window.addEventListener("hashchange", route);
 route();
 health();
 setInterval(health, 15000);
-setInterval(() => { if (current && !$("#project").hidden) showProject(current); }, 10000);
+setInterval(() => { if (current && !$("#project").hidden) showProject(current); }, 4000);

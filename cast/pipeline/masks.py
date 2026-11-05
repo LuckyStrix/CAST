@@ -33,7 +33,7 @@ def session():
         raise PipelineError(f"The masking model could not be loaded: {e}") from None
 
 
-def make_masks(images: Path, out: Path, sess=None) -> dict:
+def make_masks(images: Path, out: Path, sess=None, progress=None) -> dict:
     import cv2
     from PIL import Image
     from rembg import remove
@@ -41,13 +41,16 @@ def make_masks(images: Path, out: Path, sess=None) -> dict:
     sess = sess or session()
     out.mkdir(parents=True, exist_ok=True)
     coverage = []
-    for path in sorted(images.glob("*.jpg")):
+    paths = sorted(images.glob("*.jpg"))
+    for i, path in enumerate(paths, 1):
         im = Image.open(path).convert("RGB")
         mask = np.asarray(remove(im, session=sess, only_mask=True).convert("L")) > 127
         k = max(1, round(ERODE_PX_PER_1000 * max(im.size) / 1000))
         mask = cv2.erode(mask.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
         Image.fromarray((mask * 255).astype(np.uint8)).save(out / (path.name + ".png"))
         coverage.append(float(mask.mean()))
+        if progress:
+            progress(i / len(paths))
     if not coverage:
         raise PipelineError("No frames to mask.")
     median = float(np.median(coverage))

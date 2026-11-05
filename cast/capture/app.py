@@ -243,6 +243,9 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
         out = {"status": cap["status"], "error": cap["error"]}
         if cap["status"] == "uploading":
             out["have"] = have_chunks(cid)
+        if cap["status"] == "processing":
+            p = json.loads(cap["progress"] or "{}")
+            out["progress"] = {k: p[k] for k in ("fraction", "eta_seconds") if k in p}
         return out
 
     return app

@@ -109,7 +109,8 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
                 dict(i, url=f"{base}/c/{i['token']}", active=db.invite_active(i))
                 for i in invites
             ],
-            "captures": [dict(c, meta=json.loads(c["meta"])) for c in caps],
+            "captures": [dict(c, meta=json.loads(c["meta"]), progress=json.loads(c["progress"]))
+                         for c in caps],
         }
 
     @app.post("/api/projects/{pid}/invites")
@@ -164,6 +165,26 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
     def model(cid: str):
         return FileResponse(run_file(cid, "model.glb"), media_type="model/gltf-binary",
                             filename=f"cast-{cid[:8]}.glb")
+
+    @app.get("/api/captures/{cid}/log")
+    def run_log(cid: str):
+        """The pipeline's own log, then the end of COLMAP's output."""
+        if not db.is_capture_id(cid):
+            raise HTTPException(404, "no such capture")
+        out = []
+        steps = cfg.runs / cid / "run.log"
+        out.append(steps.read_text(errors="replace") if steps.exists() else "(not started)\n")
+        tool = cfg.runs / cid / "colmap.log"
+        if tool.exists():
+            with open(tool, "rb") as fh:
+                fh.seek(max(0, tool.stat().st_size - 16_000))
+                tail = fh.read().decode(errors="replace").splitlines()[1:][-60:]
+            out.append("\n--- COLMAP, last lines ---\n" + "\n".join(tail))
+        return Response("".join(out), media_type="text/plain; charset=utf-8")
+
+    @app.get("/view-log")
+    def log_page():
+        return FileResponse(web / "studio" / "log.html")
 
     @app.get("/api/captures/{cid}/report")
     def report(cid: str):

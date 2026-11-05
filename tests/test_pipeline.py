@@ -93,8 +93,11 @@ def test_worker_reconstructs_and_reports(cfg, token, monkeypatch):
     stages = []
 
     def fake(video, meta, mode, run_dir, progress):
-        progress("frames")
-        stages.append(_row(cfg, cid)["stage"])
+        progress("frames", 0.5)
+        row = _row(cfg, cid)
+        stages.append(row["stage"])
+        p = json.loads(row["progress"])
+        assert p["stage"] == "frames" and 0 < p["fraction"] < 0.1 and p["eta_seconds"] > 0
         return {"poses": {"placed": 10}}
 
     monkeypatch.setattr("cast.pipeline.run.process", fake)
@@ -154,3 +157,38 @@ def test_heartbeat_thread(tmp_path):
     loop.heartbeat(beat, every=0.05)
     time.sleep(0.2)
     assert beat.exists()
+
+
+def test_tracker_eta():
+    now = [0.0]
+    t = loop.Tracker(["frames", "poses", "dense"], {"frames": 10, "poses": 20, "dense": 70},
+                     clock=lambda: now[0])
+    p = t.update("frames", 0.0)
+    assert p["fraction"] == 0 and p["eta_seconds"] == 100
+    now[0] = 40  # poses: half done in 30 s, so about 30 s left here, plus 70 for dense
+    t.update("poses", 0.0)
+    now[0] = 70
+    p = t.update("poses", 0.5)
+    assert p["eta_seconds"] == 100 and p["fraction"] == 0.2
+    p = t.update("dense", 0.0)  # a new stage starts from its estimate
+    assert p["eta_seconds"] == 70
+
+
+def test_estimates_learn_from_finished_runs(cfg, token):
+    cid = _checked(cfg, token)
+    with db.connect(cfg.db) as con:
+        db.set_capture(con, cid, status="done",
+                       meta={"report": {"seconds": {"dense": 300, "frames": 20}}})
+    est = loop.stage_estimates(cfg)
+    assert est["dense"] == 300 and est["frames"] == 20 and est["mesh"] == loop.DEFAULT_SECONDS["mesh"]
+
+
+def test_colmap_progress_lines():
+    from cast.pipeline.colmap import line_fraction
+
+    assert line_fraction("I1105 Processed file [40/160]") == 0.25
+    assert line_fraction("Matching block [2/4, 1/4]") == 5 / 16
+    assert line_fraction("Processing view 80 / 160 for p1_000080.jpg") == 0.5
+    assert line_fraction("Registering image #12 (30)", total_images=60) == 0.5
+    assert line_fraction("Registering image #12 (30)") is None
+    assert line_fraction("nothing here") is None

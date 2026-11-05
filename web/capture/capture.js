@@ -307,7 +307,13 @@ async function pollStatus(id) {
   for (let i = 0; i < 360; i++) { // up to 30 minutes: reconstruction takes a while
     try {
       const s = await serverStatus(token, id);
-      if (s.status === "checked" || s.status === "processing") showStatus(t("status_checked"));
+      if (s.status === "checked") showStatus(t("status_checked"));
+      if (s.status === "processing") {
+        const p = s.progress || {};
+        const pct = Math.round((p.fraction || 0) * 100);
+        const mins = Math.max(1, Math.round((p.eta_seconds || 0) / 60));
+        showStatus(`${t("status_checked")} ${t("status_progress", { pct, mins })}`);
+      }
       if (s.status === "done") return showStatus(t("status_done"));
       if (s.status === "failed") return showStatus(t("status_model_failed", { error: s.error }));
       if (s.status === "rejected") return showStatus(t("status_rejected", { error: s.error }));

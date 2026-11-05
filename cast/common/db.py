@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS captures (
     meta TEXT NOT NULL DEFAULT '{}',
     error TEXT NOT NULL DEFAULT '',
     stage TEXT NOT NULL DEFAULT '',
+    progress TEXT NOT NULL DEFAULT '{}',
     created REAL NOT NULL,
     updated REAL NOT NULL
 );
@@ -83,8 +84,10 @@ def init(path: Path) -> None:
     with connect(path) as con:
         con.executescript(SCHEMA)
         cols = {r["name"] for r in con.execute("PRAGMA table_info(captures)")}
-        if "stage" not in cols:  # databases from before Phase 2
-            con.execute("ALTER TABLE captures ADD COLUMN stage TEXT NOT NULL DEFAULT ''")
+        for col, ddl in (("stage", "TEXT NOT NULL DEFAULT ''"),  # added in Phase 2
+                         ("progress", "TEXT NOT NULL DEFAULT '{}'")):
+            if col not in cols:
+                con.execute(f"ALTER TABLE captures ADD COLUMN {col} {ddl}")
 
 
 def create_project(con, name: str, mode: str) -> int:
@@ -121,8 +124,9 @@ def captures_used(con, token: str) -> int:
 
 
 def set_capture(con, capture_id: str, **fields) -> None:
-    if "meta" in fields and not isinstance(fields["meta"], str):
-        fields["meta"] = json.dumps(fields["meta"])
+    for key in ("meta", "progress"):
+        if key in fields and not isinstance(fields[key], str):
+            fields[key] = json.dumps(fields[key])
     fields["updated"] = time.time()
     cols = ", ".join(f"{k} = ?" for k in fields)
     con.execute(f"UPDATE captures SET {cols} WHERE id = ?", (*fields.values(), capture_id))

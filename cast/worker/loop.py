@@ -85,6 +85,55 @@ def drop_stale(cfg: config.Config) -> None:
             shutil.rmtree(cfg.inbox / r["id"], ignore_errors=True)
 
 
+# Seconds per stage for a ~160-frame capture before this machine has finished any run of its
+# own; after that, the median of its recent runs is used.
+DEFAULT_SECONDS = {"frames": 60, "masks": 60, "poses": 150, "dense": 900, "mesh": 120}
+
+
+def stage_estimates(cfg: config.Config) -> dict:
+    """Expected seconds per stage, from the last few finished runs on this machine."""
+    est = dict(DEFAULT_SECONDS)
+    with db.connect(cfg.db) as con:
+        rows = con.execute("SELECT meta FROM captures WHERE status = 'done'"
+                           " ORDER BY updated DESC LIMIT 5").fetchall()
+    seen: dict = {}
+    for r in rows:
+        for stage, secs in json.loads(r["meta"]).get("report", {}).get("seconds", {}).items():
+            seen.setdefault(stage, []).append(secs)
+    for stage, values in seen.items():
+        est[stage] = sorted(values)[len(values) // 2]
+    return est
+
+
+class Tracker:
+    """Turns (stage, fraction of that stage) into an overall fraction and seconds left."""
+
+    def __init__(self, stages: list, estimates: dict, clock=time.time):
+        self.stages, self.clock = stages, clock
+        self.est = {s: max(1.0, float(estimates.get(s, 60))) for s in stages}
+        self.stage, self.started = None, clock()
+
+    def update(self, stage: str, fraction: float) -> dict:
+        now = self.clock()
+        if stage != self.stage:
+            self.stage, self.started = stage, now
+        fraction = min(max(fraction, 0.0), 1.0)
+        elapsed = now - self.started
+        expected = self.est.get(stage, 60.0)
+        if fraction >= 0.1:  # measured pace beats the estimate once there is some
+            left_here = elapsed * (1 - fraction) / fraction
+        else:
+            left_here = max(expected - elapsed, expected * (1 - fraction))
+        i = self.stages.index(stage) if stage in self.stages else len(self.stages)
+        later = self.stages[i + 1:]
+        total = sum(self.est.values())
+        before = sum(self.est[s] for s in self.stages[:i])
+        return {"stage": stage, "stage_fraction": round(fraction, 3),
+                "fraction": round(min(1.0, (before + expected * fraction) / total), 3),
+                "eta_seconds": round(left_here + sum(self.est[s] for s in later)),
+                "updated": round(now)}
+
+
 MAX_ATTEMPTS = 2  # a capture whose reconstruction kills the process (out of memory) twice fails
 CRASHED = "The 3D model could not be made because of a problem on the server. The organiser can try again."
 
@@ -104,21 +153,30 @@ def reconstruct(cfg: config.Config, cap) -> None:
             return
         db.set_capture(con, cid, status="processing", error="", meta=meta)
 
-    def progress(stage):
+    from cast.pipeline.run import stages_for
+
+    tracker = Tracker(stages_for(cap["mode"]), stage_estimates(cfg))
+    last = {"stage": None, "time": 0.0}
+
+    def progress(stage, fraction):
+        now = time.time()
+        if stage == last["stage"] and now - last["time"] < 2:  # at most every 2 s
+            return
+        last.update(stage=stage, time=now)
         with db.connect(cfg.db) as con:
-            db.set_capture(con, cid, stage=stage)
+            db.set_capture(con, cid, stage=stage, progress=tracker.update(stage, fraction))
 
     try:
         report = process(db.video_path(cfg.inbox, cid, cap["mime"]), meta, cap["mode"],
                          cfg.runs / cid, progress)
     except PipelineError as e:
         with db.connect(cfg.db) as con:
-            db.set_capture(con, cid, status="failed", stage="", error=str(e))
+            db.set_capture(con, cid, status="failed", stage="", error=str(e), progress={})
         return
     meta["report"] = report
     meta.pop("attempts")
     with db.connect(cfg.db) as con:
-        db.set_capture(con, cid, status="done", stage="", meta=meta)
+        db.set_capture(con, cid, status="done", stage="", meta=meta, progress={})
 
 
 def step_check(cfg: config.Config) -> bool:
