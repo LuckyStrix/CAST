@@ -55,6 +55,8 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path, progress=lambda s
                            "points": model.points, "error_px": round(model.error, 3),
                            "colmap_seconds": {k: round(v) for k, v in secs.items()}}
         state["model"] = str(model.folder)
+        state["cameras"] = {"names": model.names, "centres": model.centres.tolist(),
+                            "ups": model.ups.tolist(), "forwards": model.forwards.tolist()}
         if len(model.names) < colmap.MIN_REGISTERED * total:
             raise PipelineError(f"Only {len(model.names)} of {total} frames could be placed. "
                                 "Walk slower and keep the whole object in view.")
@@ -63,8 +65,7 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path, progress=lambda s
                                 "before and after turning the object over.")
 
     def do_dense():
-        model = colmap.read_model(Path(state["model"]), log)
-        secs = colmap.dense(images, model, dense_dir, log)
+        secs = colmap.dense(images, Path(state["model"]), dense_dir, log)
         fusion_masks = None
         if use_masks:  # fusion reads undistorted images, so mask those
             fusion_masks = dense_dir / "masks"
@@ -73,11 +74,12 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path, progress=lambda s
         report["dense_seconds"] = {k: round(v) for k, v in secs.items()}
 
     def do_mesh():
-        model = colmap.read_model(Path(state["model"]), log)
-        centre = mesh.look_at_point(model.centres, model.forwards)
-        distance = float(np.median(np.linalg.norm(model.centres - centre, axis=1)))
-        first = np.array([n.startswith("p1_") for n in model.names])
-        up = model.ups[first].mean(axis=0) if first.any() else model.ups.mean(axis=0)
+        cams = state["cameras"]
+        centres, ups = np.array(cams["centres"]), np.array(cams["ups"])
+        centre = mesh.look_at_point(centres, np.array(cams["forwards"]))
+        distance = float(np.median(np.linalg.norm(centres - centre, axis=1)))
+        first = np.array([n.startswith("p1_") for n in cams["names"]])
+        up = ups[first].mean(axis=0) if first.any() else ups.mean(axis=0)
         m = mesh.build(cloud, centre, radius=0.8 * distance, up=up)
         glb.write_glb(run_dir / "model.glb", m.vertices, m.faces, m.colors, m.normals)
         report["mesh"] = m.stats

@@ -7,6 +7,7 @@ when fusing depth maps. COLMAP's naming: the mask for `p1_000001.jpg` is `p1_000
 Model: BiRefNet (MIT) through rembg (MIT), on the GPU when onnxruntime can use it.
 """
 
+import functools
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,7 @@ MODEL = "birefnet-general-lite"
 ERODE_PX_PER_1000 = 3  # pull the edge in: edge pixels are part background
 
 
+@functools.cache
 def session():
     try:
         import onnxruntime

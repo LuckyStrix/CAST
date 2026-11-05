@@ -12,19 +12,19 @@ from cast.worker import loop
 def test_passes_skip_the_turn_over():
     markers = [{"t": 0, "event": "start"}, {"t": 30, "event": "pass1_end"},
                {"t": 40, "event": "pass2_start"}, {"t": 70, "event": "stop"}]
-    assert frames.passes(markers, 70.5, "object") == [(0, 29.3), (40.7, 70)]
+    assert frames.passes(markers, 70.5, "object") == [(1, 0, 29.3), (2, 40.7, 70)]
     # in the ground: nothing moves, so the whole recording is one segment
-    assert frames.passes(markers, 70.5, "in-situ") == [(0, 70)]
+    assert frames.passes(markers, 70.5, "in-situ") == [(1, 0, 70)]
     # no markers (e.g. an old capture): the whole video
-    assert frames.passes([], 12, "object") == [(0, 12)]
-    # a pass too short to use is dropped
+    assert frames.passes([], 12, "object") == [(1, 0, 12)]
+    # a pass too short to use is dropped, and the other keeps its real number
     short = [{"t": 2, "event": "pass1_end"}, {"t": 5, "event": "pass2_start"}]
-    assert frames.passes(short, 30, "object") == [(5.7, 30)]
+    assert frames.passes(short, 30, "object") == [(2, 5.7, 30)]
 
 
 def test_split_and_select():
-    assert frames.split_count([(0, 30), (40, 70)], 160) == [80, 80]
-    assert frames.split_count([(0, 10), (10, 100)], 100) == [20, 90]  # at least 20 each
+    assert frames.split_count([(1, 0, 30), (2, 40, 70)], 160) == [80, 80]
+    assert frames.split_count([(1, 0, 10), (2, 10, 100)], 100) == [20, 90]  # at least 20 each
     assert frames.select_sharpest([1, 9, 2, 3, 8, 1], 2) == [1, 4]
     assert frames.select_sharpest([1, 2], 5) == [0, 1]
 
@@ -98,8 +98,8 @@ def test_worker_reconstructs_and_reports(cfg, token, monkeypatch):
         return {"poses": {"placed": 10}}
 
     monkeypatch.setattr("cast.pipeline.run.process", fake)
-    assert not loop.step(cfg)  # without COLMAP, checked captures wait
-    assert loop.step(cfg, can_reconstruct=True)
+    assert not loop.step_check(cfg)  # the upload checker leaves checked captures alone
+    assert loop.step_reconstruct(cfg)
     row = _row(cfg, cid)
     assert stages == ["frames"] and row["status"] == "done"
     assert json.loads(row["meta"])["report"]["poses"]["placed"] == 10
@@ -112,7 +112,7 @@ def test_worker_reports_pipeline_errors(cfg, token, monkeypatch):
         raise PipelineError("The two sides could not be joined.")
 
     monkeypatch.setattr("cast.pipeline.run.process", fail)
-    loop.step(cfg, can_reconstruct=True)
+    loop.step_reconstruct(cfg)
     row = _row(cfg, cid)
     assert row["status"] == "failed" and "joined" in row["error"]
 
@@ -126,3 +126,31 @@ def test_retry(studio, cfg, token):
     assert _row(cfg, cid)["status"] == "checked"
     assert studio.get(f"/api/captures/{cid}/model.glb").status_code == 404
     assert studio.get("/api/captures/../../etc/model.glb").status_code == 404
+
+
+def test_process_killing_capture_is_not_retried_forever(cfg, token, monkeypatch):
+    # The process dies mid-run (e.g. out of memory): the row stays 'processing' and the
+    # restarted worker picks it up again. After MAX_ATTEMPTS starts it must give up.
+    cid = _checked(cfg, token)
+
+    def killed(*a, **k):
+        raise SystemExit  # stands in for SIGKILL: nothing after this line runs
+
+    monkeypatch.setattr("cast.pipeline.run.process", killed)
+    for _ in range(loop.MAX_ATTEMPTS):
+        with pytest.raises(SystemExit):
+            loop.step_reconstruct(cfg)
+        assert _row(cfg, cid)["status"] == "processing"
+    loop.step_reconstruct(cfg)
+    row = _row(cfg, cid)
+    assert row["status"] == "failed" and row["error"] == loop.CRASHED
+    assert not loop.step_reconstruct(cfg)  # the queue moves on
+
+
+def test_heartbeat_thread(tmp_path):
+    import time
+
+    beat = tmp_path / "hb"
+    loop.heartbeat(beat, every=0.05)
+    time.sleep(0.2)
+    assert beat.exists()

@@ -33,7 +33,7 @@ def status(cfg, cid):
 @needs_ffmpeg
 def test_rejects_garbage(cfg, token):
     cid = add_capture(cfg, token, b"<html>not a video</html>")
-    assert loop.step(cfg)
+    assert loop.step_check(cfg)
     s = status(cfg, cid)
     assert s["status"] == "rejected" and "could not be read" in s["error"]
 
@@ -44,11 +44,11 @@ def test_accepts_video(cfg, token, tmp_path):
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30",
                     "-t", "6", "-pix_fmt", "yuv420p", str(src)], check=True)
     cid = add_capture(cfg, token, video=src)
-    assert loop.step(cfg)
+    assert loop.step_check(cfg)
     s = status(cfg, cid)
     assert s["status"] == "checked", s["error"]
     assert '"width": 1280' in s["meta"]
-    assert not loop.step(cfg)  # nothing left
+    assert not loop.step_check(cfg)  # nothing left
 
 
 @needs_ffmpeg
@@ -68,9 +68,9 @@ def test_worker_survives_unexpected_errors(cfg, token, monkeypatch):
         raise RuntimeError("disk on fire")
 
     monkeypatch.setattr(loop, "probe", boom)
-    assert loop.step(cfg)
+    assert loop.step_check(cfg)
     assert status(cfg, cid)["status"] == "rejected"
-    assert not loop.step(cfg)  # not picked again
+    assert not loop.step_check(cfg)  # not picked again
 
 
 def test_drops_stale_uploads(cfg, token):

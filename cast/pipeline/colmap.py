@@ -163,11 +163,11 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path) -> tuple[Mode
     return best, secs
 
 
-def dense(images: Path, model: Model, work: Path, log: Path, max_size: int = 1600) -> dict:
+def dense(images: Path, model_dir: Path, work: Path, log: Path, max_size: int = 1600) -> dict:
     """Undistort and compute a depth map per frame (GPU). Returns timings."""
     shutil.rmtree(work, ignore_errors=True)
     secs = {"undistort": run("image_undistorter", [
-        "--image_path", images, "--input_path", model.folder, "--output_path", work,
+        "--image_path", images, "--input_path", model_dir, "--output_path", work,
         "--output_type", "COLMAP", "--max_image_size", max_size], log)}
     secs["stereo"] = run("patch_match_stereo", [
         "--workspace_path", work, "--workspace_format", "COLMAP",

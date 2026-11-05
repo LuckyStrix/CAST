@@ -29,7 +29,9 @@ async function health() {
   try {
     const s = await api("GET", "/api/status");
     const parts = [
-      el("span", { class: s.worker_ok ? "ok" : "bad" }, s.worker_ok ? "worker running" : "worker not running"),
+      el("span", { class: s.worker_ok ? "ok" : "bad" }, s.worker_ok ? "upload checks running" : "upload checks NOT running"),
+      " · ",
+      el("span", { class: s.reconstructor_ok ? "ok" : "bad" }, s.reconstructor_ok ? "GPU reconstruction running" : "GPU reconstruction NOT running"),
       " · ",
       el("span", { class: s.disk_ok ? "ok" : "bad" }, `${s.disk_free_gb} GB free`),
       ` · ${s.user}`,

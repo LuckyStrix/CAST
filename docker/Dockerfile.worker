@@ -1,6 +1,7 @@
-# GPU worker: COLMAP (CUDA) from the official image, plus Python for the CAST pipeline.
+# GPU reconstructor: COLMAP (CUDA) from the official image, plus Python for the CAST pipeline.
 # Needs an NVIDIA GPU and Docker's GPU support (Docker Desktop on Windows has it built in).
-FROM colmap/colmap:latest
+# Pinned: the pipeline is checked against this COLMAP (4.2.1). Change it on purpose, then test.
+FROM colmap/colmap@sha256:c1de51615dff33066cd305071226b6343c1168324ef3bd622f0825e55feb5efe
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -29,4 +30,4 @@ RUN pip install --no-cache-dir --no-deps . && pip install --no-cache-dir fastapi
 
 ENV CAST_DATA=/data CAST_WEB=/app/web
 USER cast
-CMD ["cast-worker"]
+CMD ["cast-worker", "--reconstruct"]

@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS captures (
 # Capture status: uploading -> received (all chunks joined) -> checked | rejected (worker)
 #   -> processing (stage = current pipeline stage) -> done | failed
 # An upload can also end as cancelled (by the phone) or abandoned (no activity for weeks).
-CLOSED = ("rejected", "abandoned", "cancelled")  # these don't use up an invite's capture limit
+CLOSED = ("rejected", "failed", "abandoned", "cancelled")  # these don't use up an invite's capture limit
 
 
 def is_capture_id(s: str) -> bool:

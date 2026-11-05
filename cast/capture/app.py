@@ -105,7 +105,7 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
 
     def gone_unless_open(cap):
         """Closed captures can't take more data. The phone must not think it was sent."""
-        if cap["status"] in db.CLOSED and cap["status"] != "rejected":
+        if cap["status"] in ("abandoned", "cancelled"):  # (rejected/failed: the video arrived)
             raise HTTPException(410, "This upload was stopped. Please record again.")
 
     def chunk_dir(cid):

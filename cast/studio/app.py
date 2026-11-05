@@ -52,13 +52,16 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
 
     @app.get("/api/status")
     def status(request: Request):
-        beat = cfg.data / "worker.heartbeat"
-        age = time.time() - beat.stat().st_mtime if beat.exists() else None
+        def alive(name):
+            beat = cfg.data / name
+            return beat.exists() and time.time() - beat.stat().st_mtime < 30
+
         free = shutil.disk_usage(cfg.data).free
         return {
             "user": request.headers.get("tailscale-user-login", "local"),
             "capture_url": public_base(request),
-            "worker_ok": age is not None and age < 30,
+            "worker_ok": alive("worker.heartbeat"),
+            "reconstructor_ok": alive("reconstructor.heartbeat"),
             "disk_free_gb": round(free / 1e9, 1),
             "disk_ok": free > 20e9,
         }
@@ -171,14 +174,17 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
         """Run reconstruction again: a failed run continues from the stage that failed, a
         finished one starts over (e.g. after the pipeline has improved)."""
         with db.connect(cfg.db) as con:
-            cap = con.execute("SELECT status FROM captures WHERE id = ?", (cid,)).fetchone()
+            cap = con.execute("SELECT status, meta FROM captures WHERE id = ?", (cid,)).fetchone()
             if cap is None:
                 raise HTTPException(404, "no such capture")
             if cap["status"] not in ("failed", "done"):
                 raise HTTPException(409, f"cannot retry a capture that is {cap['status']}")
             if cap["status"] == "done":
                 shutil.rmtree(cfg.runs / cid, ignore_errors=True)
-            db.set_capture(con, cid, status="checked", error="", stage="")
+            meta = json.loads(cap["meta"])
+            meta.pop("report", None)
+            meta.pop("attempts", None)
+            db.set_capture(con, cid, status="checked", error="", stage="", meta=meta)
         return {"ok": True}
 
     return app

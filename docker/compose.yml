@@ -2,7 +2,8 @@
 #
 #   phones ──Funnel :443──► tailscale ──capture_net──► capture   (public, upload-only)
 #   tailnet ─Serve  :8443─► tailscale ──studio_net───► studio    (tailnet only)
-#                                                      worker    (no network at all)
+#                                                      worker    (checks uploads; no network)
+#                                                      reconstructor (GPU; no network)
 #
 # capture and studio are on separate networks, so the public app can never reach studio.
 
@@ -42,10 +43,17 @@ services:
     networks: [studio_net]
     restart: unless-stopped
 
-  worker:  # GPU: COLMAP + the reconstruction pipeline
+  worker:  # checks uploads; runs anywhere
+    image: cast:local
+    command: cast-worker
+    volumes: [cast-data:/data]
+    network_mode: none
+    restart: unless-stopped
+
+  reconstructor:  # builds 3D models; needs an NVIDIA GPU (without one, only this service fails)
     build: { context: .., dockerfile: docker/Dockerfile.worker }
     image: cast-worker:local
-    command: cast-worker
+    command: cast-worker --reconstruct
     volumes: [cast-data:/data]
     network_mode: none
     shm_size: 2gb

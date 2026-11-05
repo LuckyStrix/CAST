@@ -22,20 +22,22 @@ FLIP_MARGIN = 0.7  # seconds trimmed either side of the turn-over: hands come in
 MIN_SEGMENT = 3.0  # a pass shorter than this is not used
 
 
-def passes(markers: list, duration: float, mode: str) -> list[tuple[float, float]]:
-    """(start, end) seconds of each pass to use."""
+def passes(markers: list, duration: float, mode: str) -> list[tuple[int, float, float]]:
+    """(pass number, start, end) of each pass to use. The number is the real pass (1 or 2),
+    even when the other pass was too short to keep: later stages rely on p1 = the first side."""
     t = {m.get("event"): float(m.get("t", 0)) for m in markers or []}
     end = min(t.get("stop", duration), duration)
     if mode == "object" and "pass1_end" in t and "pass2_start" in t:
         segs = [(0.0, t["pass1_end"] - FLIP_MARGIN), (t["pass2_start"] + FLIP_MARGIN, end)]
     else:
         segs = [(0.0, end)]  # one pass, or two continuous loops of a still scene
-    return [(round(a, 2), round(b, 2)) for a, b in segs if b - a >= MIN_SEGMENT]
+    return [(k, round(a, 2), round(b, 2)) for k, (a, b) in enumerate(segs, 1)
+            if b - a >= MIN_SEGMENT]
 
 
 def split_count(segs, total: int) -> list[int]:
     """Frames to keep per segment, in proportion to its length (at least 20 each)."""
-    lengths = np.array([b - a for a, b in segs], float)
+    lengths = np.array([b - a for _, a, b in segs], float)
     return [max(20, round(total * n / lengths.sum())) for n in lengths]
 
 
@@ -84,7 +86,7 @@ def make_frames(video: Path, markers: list, duration: float, mode: str, out: Pat
         shutil.rmtree(out)
     out.mkdir(parents=True)
     report = {"passes": []}
-    for k, ((a, b), count) in enumerate(zip(segs, split_count(segs, total)), 1):
+    for (k, a, b), count in zip(segs, split_count(segs, total)):
         scratch = out.parent / f"candidates_{k}"
         if scratch.exists():
             shutil.rmtree(scratch)
@@ -94,7 +96,8 @@ def make_frames(video: Path, markers: list, duration: float, mode: str, out: Pat
         for n, i in enumerate(keep, 1):
             shutil.copyfile(cands[i], out / f"p{k}_{n:06d}.jpg")
         shutil.rmtree(scratch)
-        report["passes"].append({"start": a, "end": b, "candidates": len(cands), "kept": len(keep)})
+        report["passes"].append({"pass": k, "start": a, "end": b, "candidates": len(cands),
+                                 "kept": len(keep)})
     report["frames"] = sum(p["kept"] for p in report["passes"])
     if report["frames"] < 20:
         raise PipelineError("Too few usable frames. Please record a slower, longer walk round.")
