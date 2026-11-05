@@ -1,0 +1,309 @@
+// The phone capture flow: consent → mode → checklist → record (two passes) → send → status.
+
+import { store, Uploader, serverStatus, projectInfo } from "./store.js";
+import { TurnTracker, QualityCheck } from "./guide.js";
+
+const $ = (id) => document.getElementById(id);
+const token = location.pathname.split("/").filter(Boolean).pop();
+const CHUNK = 4 * 1024 * 1024; // at most this per piece: kinder to weak mobile links
+
+// --- Text -----------------------------------------------------------------------------------
+let strings = {};
+async function loadStrings() {
+  const en = await (await fetch("/i18n/en.json")).json();
+  const lang = (navigator.language || "en").slice(0, 2);
+  let local = {};
+  if (lang !== "en") local = await fetch(`/i18n/${lang}.json`).then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
+  strings = { ...en, ...local };
+  document.documentElement.lang = lang;
+  document.querySelectorAll("[data-t]").forEach((el) => { el.textContent = t(el.dataset.t); });
+}
+function t(key, vars = {}) {
+  return (strings[key] || key).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
+}
+
+// --- Screens --------------------------------------------------------------------------------
+function show(name) {
+  document.querySelectorAll("body > main").forEach((m) => { m.hidden = m.id !== `s-${name}`; });
+}
+function message(text) { $("message").textContent = text; show("message"); }
+
+// --- State ----------------------------------------------------------------------------------
+let info = null;
+let mode = "object";
+let stream = null, recorder = null, recording = null; // recording: the stored capture record
+let pass = 1, startedAt = 0, timerId = 0, checkId = 0;
+const turn = new TurnTracker();
+let quality = null;
+let waitingFor = null; // capture id whose result the status screen shows
+
+const uploader = new Uploader(onUpload);
+
+function onUpload(p) {
+  if (p.id === waitingFor) {
+    if (p.state === "sending" && p.total) setUpload(p.sent / p.total);
+    if (p.state === "offline") $("upload-note").textContent = t("upload_offline");
+    if (p.state === "done") { setUpload(1); pollStatus(p.id); }
+    if (p.state === "failed") {
+      if (recorder && recorder.state === "recording") { recording.cancelled = true; stopRecording(); }
+      closeCamera();
+      showStatus(t("status_failed", { error: p.error }));
+    }
+  } else if (p.state === "sending" && p.total) {
+    $("pending").hidden = false;
+    $("pending").textContent = t("pending_banner", { pct: Math.round((100 * p.sent) / p.total) });
+  } else if (p.state === "done" || p.state === "failed") {
+    $("pending").hidden = true;
+  }
+}
+
+function setUpload(f) {
+  $("upload-bar").style.width = `${Math.round(f * 100)}%`;
+  $("upload-pct").textContent = t("upload_progress", { pct: Math.round(f * 100) });
+}
+
+// --- Start ----------------------------------------------------------------------------------
+async function init() {
+  await loadStrings();
+  try {
+    info = await projectInfo(token);
+  } catch {
+    if (!navigator.onLine && (await store.allCaptures()).length) {
+      message(t("upload_offline")); uploader.kick(); return;
+    }
+    message(t("invalid")); return;
+  }
+  mode = info.mode;
+  $("project-name").textContent = t("project", { name: info.project });
+  $("consent-1").textContent = t("consent_1", { name: info.project });
+  uploader.kick(); // anything left from an earlier visit
+  show("consent");
+}
+
+$("consent").addEventListener("change", (e) => { $("consent-next").disabled = !e.target.checked; });
+$("consent-next").addEventListener("click", () => show("mode"));
+document.querySelectorAll("[data-mode]").forEach((b) =>
+  b.addEventListener("click", () => {
+    mode = b.dataset.mode;
+    document.body.className = `mode-${mode}`;
+    show("check");
+  }),
+);
+
+$("start-camera").addEventListener("click", async () => {
+  if (!navigator.mediaDevices || !window.MediaRecorder) { message(t("no_camera")); return; }
+  await turn.start(); // asks for motion permission on iOS; fine if refused
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 30 } },
+    });
+  } catch {
+    message(t("camera_denied")); return;
+  }
+  $("preview").srcObject = stream;
+  quality = new QualityCheck($("preview"));
+  pass = 1;
+  resetRecordUi();
+  show("record");
+});
+
+function resetRecordUi() {
+  $("rec").hidden = false;
+  $("round-done").hidden = true;
+  $("finish").hidden = true;
+  $("flip").hidden = true;
+  $("warning").hidden = true;
+  $("timer").textContent = "0:00";
+  $("pass-label").textContent = t("pass_label", { n: 1 });
+  $("hint").textContent = hintFor(1);
+  setRing(0);
+}
+
+function hintFor(p) {
+  return t(`rec_hint_${mode === "object" ? "object" : "insitu"}_${p}`);
+}
+function setRing(f) { $("ring").style.strokeDashoffset = String(264 * (1 - f)); }
+
+// --- Recording ------------------------------------------------------------------------------
+function pickMime() {
+  const options = ["video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+  return options.find((m) => MediaRecorder.isTypeSupported(m)) || "";
+}
+
+let wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch { warn(t("warn_screen"), 4000); }
+}
+
+$("rec").addEventListener("click", async () => {
+  const mime = pickMime();
+  const s = stream.getVideoTracks()[0].getSettings();
+  const bits = Math.min(30e6, Math.max(8e6, (s.width || 1920) * (s.height || 1080) * (s.frameRate || 30) * 0.2));
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: bits } : { videoBitsPerSecond: bits });
+  recording = {
+    id: crypto.randomUUID(), token, mode, mime: (recorder.mimeType || mime || "video/webm").split(";")[0],
+    device: navigator.userAgent, total: null, created: Date.now(), created_on_server: false,
+    meta: { mode, markers: [], camera: { width: s.width, height: s.height, fps: s.frameRate }, sensor: false },
+  };
+  await store.putCapture(recording);
+  waitingFor = recording.id; // so a refusal from the server shows even while recording
+
+  const chunk = Math.min(CHUNK, info.chunk_bytes);
+  let n = 0, size = 0, buf = new Blob([]), saving = Promise.resolve();
+  const save = (blob) => {
+    const i = n++;
+    saving = saving.then(() => store.putChunk(recording.id, i, blob)).then(() => uploader.kick());
+  };
+  recorder.ondataavailable = (e) => {
+    if (!e.data || !e.data.size) return;
+    buf = new Blob([buf, e.data]);
+    size += e.data.size;
+    while (buf.size >= chunk) { save(buf.slice(0, chunk)); buf = buf.slice(chunk); }
+    if (size > 0.97 * info.max_bytes) stopRecording(); // the server's size limit
+  };
+  recorder.onstop = async () => {
+    if (buf.size) save(buf);
+    await saving;
+    if (recording.cancelled) {
+      const c = await store.getCapture(recording.id);
+      await store.delCapture(recording.id);
+      if (c && c.created_on_server) fetch(`/api/${token}/captures/${recording.id}/cancel`, { method: "POST" }).catch(() => {});
+      return;
+    }
+    recording.meta.sensor = turn.hasSensor;
+    recording.meta.heading = turn.samples;
+    await store.patchCapture(recording.id, { total: n, meta: recording.meta });
+    setUpload(0);
+    show("upload");
+    uploader.kick();
+  };
+  recorder.start(1000);
+  keepAwake();
+  turn.begin();
+  startedAt = performance.now();
+  mark("start");
+  $("rec").hidden = true;
+  $("round-done").hidden = false;
+  timerId = setInterval(tick, 250);
+  checkId = setInterval(checkPicture, 500);
+});
+
+function elapsed() { return (performance.now() - startedAt) / 1000; }
+function mark(event) { recording.meta.markers.push({ t: +elapsed().toFixed(2), event }); }
+
+function tick() {
+  const sec = elapsed();
+  $("timer").textContent = `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+  // Without a gyroscope, assume about 40 s per loop.
+  const passStart = recording.meta.markers.filter((m) => m.event === "start" || m.event === "pass2_start").pop().t;
+  const f = turn.hasSensor ? turn.fraction() : Math.min(1, (sec - passStart) / 40);
+  setRing(f);
+  if (f >= 1 && pass === 1 && $("flip").hidden) endPass1();
+  if (f >= 1 && pass === 2 && $("finish").hidden) {
+    $("finish").hidden = false;
+    $("round-done").hidden = true;
+    $("hint").textContent = t("all_done");
+  }
+  if (turn.hasSensor && turn.rate > 40) warn(t("warn_fast"));
+  if (sec >= info.max_seconds - 1) stopRecording();
+}
+
+function checkPicture() {
+  const q = quality.measure();
+  if (!q) return;
+  if (q.brightness < 45) warn(t("warn_dark"));
+  else if (q.brightness > 235) warn(t("warn_bright"));
+  else if (q.blurry) warn(t("warn_blur"));
+}
+
+let warnTimer = 0;
+function warn(text, ms = 1200) {
+  $("warning").textContent = text;
+  $("warning").hidden = false;
+  clearTimeout(warnTimer);
+  warnTimer = setTimeout(() => { $("warning").hidden = true; }, ms);
+}
+
+function endPass1() {
+  mark("pass1_end");
+  if (mode === "object") {
+    $("flip").hidden = false;
+  } else {
+    startPass2();
+  }
+}
+
+function startPass2() {
+  mark("pass2_start");
+  pass = 2;
+  turn.reset();
+  $("flip").hidden = true;
+  $("pass-label").textContent = t("pass_label", { n: 2 });
+  $("hint").textContent = hintFor(2);
+  setRing(0);
+}
+
+$("flip-done").addEventListener("click", startPass2);
+
+$("round-done").addEventListener("click", () => {
+  if (turn.hasSensor && turn.fraction() < 0.75 && !confirm(t("warn_early"))) return;
+  if (pass === 1) endPass1();
+  else { $("finish").hidden = false; $("round-done").hidden = true; $("hint").textContent = t("all_done"); }
+});
+
+$("finish").addEventListener("click", stopRecording);
+
+$("cancel").addEventListener("click", () => {
+  if (recorder && recorder.state === "recording") {
+    if (!confirm(t("cancel_confirm"))) return;
+    recording.cancelled = true;
+    stopRecording();
+  }
+  closeCamera();
+  show("check");
+});
+
+function stopRecording() {
+  if (!recorder || recorder.state !== "recording") return;
+  mark("stop");
+  clearInterval(timerId);
+  clearInterval(checkId);
+  recorder.stop();
+  if (wakeLock) wakeLock.release().catch(() => {});
+  if (!recording.cancelled) closeCamera();
+}
+
+function closeCamera() {
+  if (stream) stream.getTracks().forEach((tr) => tr.stop());
+  stream = null;
+}
+
+// --- After sending --------------------------------------------------------------------------
+function showStatus(text) {
+  $("status-text").textContent = text;
+  show("status");
+}
+
+async function pollStatus(id) {
+  showStatus(t("status_received"));
+  for (let i = 0; i < 120; i++) {
+    try {
+      const s = await serverStatus(token, id);
+      if (s.status === "checked") return showStatus(t("status_checked"));
+      if (s.status === "rejected") return showStatus(t("status_rejected", { error: s.error }));
+    } catch { /* keep trying */ }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+
+$("again").addEventListener("click", () => { waitingFor = null; show("mode"); });
+
+window.addEventListener("beforeunload", (e) => {
+  if (uploader.running || (recorder && recorder.state === "recording")) {
+    e.preventDefault();
+    e.returnValue = t("leave_warning");
+  }
+});
+
+init();

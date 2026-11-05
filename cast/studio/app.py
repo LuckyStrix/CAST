@@ -1,0 +1,156 @@
+"""The studio site: projects, invite links, captures. Tailnet only.
+
+`tailscale serve` adds Tailscale-User-Login to every tailnet request and Funnel traffic never
+carries it. Studio sits on a docker network shared only with the tailscale container, so nothing
+else (in particular not the public capture app) can reach it and forge that header.
+"""
+
+import json
+import os
+import shutil
+import time
+
+import segno
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+
+from cast.common import config, db
+from cast.common.web import add_security_headers
+
+
+def create_app(cfg: config.Config | None = None) -> FastAPI:
+    cfg = cfg or config.load()
+    db.init(cfg.db)
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.middleware("http")(add_security_headers)
+
+    @app.middleware("http")
+    async def tailnet_only(request: Request, call_next):
+        if not cfg.trust_local and not request.headers.get("tailscale-user-login"):
+            return JSONResponse({"error": "Studio is only reachable on your tailnet."}, 403)
+        return await call_next(request)
+
+    web = config.WEB
+    app.mount("/assets", StaticFiles(directory=web / "studio"), name="assets")
+
+    def public_base(request: Request) -> str:
+        """Where phones reach the capture site: the same machine name on Funnel's port 443."""
+        if os.environ.get("CAST_PUBLIC_URL"):
+            return os.environ["CAST_PUBLIC_URL"].rstrip("/")
+        return "https://" + request.url.hostname
+
+    @app.get("/")
+    def index():
+        return FileResponse(web / "studio" / "index.html")
+
+    @app.get("/api/status")
+    def status(request: Request):
+        beat = cfg.data / "worker.heartbeat"
+        age = time.time() - beat.stat().st_mtime if beat.exists() else None
+        free = shutil.disk_usage(cfg.data).free
+        return {
+            "user": request.headers.get("tailscale-user-login", "local"),
+            "capture_url": public_base(request),
+            "worker_ok": age is not None and age < 30,
+            "disk_free_gb": round(free / 1e9, 1),
+            "disk_ok": free > 20e9,
+        }
+
+    @app.get("/api/projects")
+    def projects():
+        with db.connect(cfg.db) as con:
+            rows = con.execute(
+                "SELECT p.*, (SELECT COUNT(*) FROM captures c WHERE c.project_id = p.id) AS n"
+                " FROM projects p ORDER BY p.created DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    @app.post("/api/projects")
+    async def new_project(request: Request):
+        body = await request.json()
+        name = str(body.get("name", "")).strip()[:200]
+        if not name:
+            raise HTTPException(400, "name is required")
+        try:
+            with db.connect(cfg.db) as con:
+                pid = db.create_project(con, name, body.get("mode", "object"))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        return {"id": pid}
+
+    @app.get("/api/projects/{pid}")
+    def project(pid: int, request: Request):
+        with db.connect(cfg.db) as con:
+            p = con.execute("SELECT * FROM projects WHERE id = ?", (pid,)).fetchone()
+            if p is None:
+                raise HTTPException(404, "no such project")
+            invites = con.execute(
+                "SELECT i.*, (SELECT COUNT(*) FROM captures c WHERE c.invite = i.token) AS used"
+                " FROM invites i WHERE project_id = ? ORDER BY created DESC",
+                (pid,),
+            ).fetchall()
+            caps = con.execute(
+                "SELECT * FROM captures WHERE project_id = ? ORDER BY created DESC", (pid,)
+            ).fetchall()
+        base = public_base(request)
+        return {
+            "project": dict(p),
+            "invites": [
+                dict(i, url=f"{base}/c/{i['token']}", active=db.invite_active(i))
+                for i in invites
+            ],
+            "captures": [dict(c, meta=json.loads(c["meta"])) for c in caps],
+        }
+
+    @app.post("/api/projects/{pid}/invites")
+    async def new_invite(pid: int, request: Request):
+        body = await request.json()
+        days = body.get("days", 30)
+        max_caps = body.get("max_captures")
+        with db.connect(cfg.db) as con:
+            if con.execute("SELECT 1 FROM projects WHERE id = ?", (pid,)).fetchone() is None:
+                raise HTTPException(404, "no such project")
+            token = db.create_invite(
+                con, pid, str(body.get("label", ""))[:200],
+                days=float(days) if days else None,
+                max_captures=int(max_caps) if max_caps else None,
+            )
+        return {"token": token, "url": f"{public_base(request)}/c/{token}"}
+
+    @app.post("/api/invites/{token}/revoke")
+    def revoke(token: str):
+        with db.connect(cfg.db) as con:
+            con.execute("UPDATE invites SET revoked = 1 WHERE token = ?", (token,))
+        return {"ok": True}
+
+    @app.get("/api/invites/{token}/qr.svg")
+    def qr(token: str, request: Request):
+        with db.connect(cfg.db) as con:
+            if con.execute("SELECT 1 FROM invites WHERE token = ?", (token,)).fetchone() is None:
+                raise HTTPException(404, "no such invite")
+        svg = segno.make(f"{public_base(request)}/c/{token}", error="m").svg_inline(scale=6)
+        return Response(svg, media_type="image/svg+xml")
+
+    @app.get("/api/captures/{cid}/video")
+    def video(cid: str):
+        with db.connect(cfg.db) as con:
+            cap = con.execute("SELECT mime FROM captures WHERE id = ?", (cid,)).fetchone()
+        if cap is None:
+            raise HTTPException(404, "no such capture")
+        path = db.video_path(cfg.inbox, cid, cap["mime"])
+        if not path.exists():
+            raise HTTPException(404, "not uploaded yet")
+        return FileResponse(path, media_type=cap["mime"])
+
+    return app
+
+
+def main():
+    uvicorn.run(
+        create_app(),
+        host=os.environ.get("CAST_STUDIO_HOST", "127.0.0.1"),
+        port=int(os.environ.get("CAST_STUDIO_PORT", "8002")),
+        log_level="info",
+    )
