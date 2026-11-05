@@ -75,7 +75,7 @@ async function showProject(id) {
   $("#captures tbody").replaceChildren(...d.captures.map((c) => {
     const v = c.meta.video;
     const notes = [];
-    if (v) notes.push(`${v.width}×${v.height} ${v.codec}, ${v.duration}s`);
+    if (v) notes.push(`${v.width}×${v.height} ${v.codec}${v.bitrate ? ` ${Math.round(v.bitrate / 1e6)} Mbps` : ""}, ${v.duration}s`);
     if (c.meta.phone && c.meta.phone.markers) notes.push(c.meta.phone.markers.map((m) => `${m.event}@${m.t}s`).join(" "));
     if (c.meta.phone && c.meta.phone.sensor === false) notes.push("no motion sensor");
     const r = c.meta.report;

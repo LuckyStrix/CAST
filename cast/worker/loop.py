@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from cast.common import config, db
 
@@ -52,6 +53,9 @@ def probe(path, timeout=60) -> dict:
         "height": int(v.get("height", 0)),
         "fps": v.get("avg_frame_rate"),
         "duration": round(duration, 2),
+        # WebM from a browser has no bitrate in its header: work it out from size and length
+        "bitrate": int(info.get("format", {}).get("bit_rate") or 0)
+        or (int(Path(path).stat().st_size * 8 / duration) if duration else 0),
     }
 
 

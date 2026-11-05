@@ -34,7 +34,7 @@ def load() -> Config:
     return Config(
         data=Path(env("CAST_DATA", str(REPO / "data"))),
         chunk_bytes=int(env("CAST_CHUNK_BYTES", str(8 * 1024 * 1024))),
-        max_capture_bytes=int(env("CAST_MAX_CAPTURE_BYTES", str(2 * 1024**3))),
+        max_capture_bytes=int(env("CAST_MAX_CAPTURE_BYTES", str(4 * 1024**3))),
         max_capture_seconds=int(env("CAST_MAX_CAPTURE_SECONDS", "300")),
         trust_local=env("CAST_TRUST_LOCAL", "0") == "1",
     )

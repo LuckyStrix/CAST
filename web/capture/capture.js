@@ -126,9 +126,35 @@ function hintFor(p) {
 function setRing(f) { $("ring").style.strokeDashoffset = String(264 * (1 - f)); }
 
 // --- Recording ------------------------------------------------------------------------------
+// Best quality the phone can record. HEVC first: about twice the detail of H.264 per bit.
 function pickMime() {
-  const options = ["video/mp4;codecs=avc1", "video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+  const options = ["video/mp4;codecs=hvc1", "video/mp4;codecs=hev1", "video/mp4;codecs=avc1",
+    "video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
   return options.find((m) => MediaRecorder.isTypeSupported(m)) || "";
+}
+
+// Record as much detail as the phone gives: fine, low-contrast texture is what the encoder
+// throws away first, and it is what reconstruction needs. The server can always drop data.
+const MAX_BITS = 80e6;
+
+// Android Chrome can lock focus, exposure and white balance (Safari ignores this). Locked,
+// frames don't change brightness or colour mid-walk and focus doesn't hunt. Best effort.
+async function lockCamera(track) {
+  const applied = {};
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  for (const key of ["focusMode", "exposureMode", "whiteBalanceMode"]) {
+    const modes = caps[key] || [];
+    const mode = ["single-shot", "manual"].find((m) => modes.includes(m));
+    if (!mode) continue;
+    try {
+      const c = { [key]: mode };
+      const now = track.getSettings();
+      if (key === "exposureMode" && mode === "manual" && now.exposureTime) c.exposureTime = now.exposureTime;
+      await track.applyConstraints({ advanced: [c] });
+      applied[key] = mode;
+    } catch { /* not supported on this phone */ }
+  }
+  return applied;
 }
 
 let wakeLock = null;
@@ -139,12 +165,14 @@ async function keepAwake() {
 $("rec").addEventListener("click", async () => {
   const mime = pickMime();
   const s = stream.getVideoTracks()[0].getSettings();
-  const bits = Math.min(30e6, Math.max(8e6, (s.width || 1920) * (s.height || 1080) * (s.frameRate || 30) * 0.2));
+  const bits = Math.min(MAX_BITS, Math.max(12e6, (s.width || 1920) * (s.height || 1080) * (s.frameRate || 30) * 0.3));
+  const locks = await lockCamera(stream.getVideoTracks()[0]);
   recorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: bits } : { videoBitsPerSecond: bits });
   recording = {
     id: crypto.randomUUID(), token, mode, mime: (recorder.mimeType || mime || "video/webm").split(";")[0],
     device: navigator.userAgent, total: null, created: Date.now(), created_on_server: false,
-    meta: { mode, markers: [], camera: { width: s.width, height: s.height, fps: s.frameRate }, sensor: false },
+    meta: { mode, markers: [], sensor: false,
+      camera: { width: s.width, height: s.height, fps: s.frameRate, codec: recorder.mimeType || mime, requested_bps: bits, locks } },
   };
   await store.putCapture(recording);
   waitingFor = recording.id; // so a refusal from the server shows even while recording
