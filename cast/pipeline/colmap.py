@@ -53,10 +53,26 @@ def line_fraction(line: str, total_images: int = 0) -> float | None:
 
 
 def run(command: str, args: list, log: Path, progress=None, total_images: int = 0,
-        passes: int = 1) -> float:
+        passes: int = 1, retries: int = 1) -> float:
     """Run `colmap command args`, appending its output to `log`. `progress(fraction)` is called
     as COLMAP reports how far it is. `passes`: how many times the command goes through every
-    image (patch_match_stereo with geometric consistency: 2)."""
+    image (patch_match_stereo with geometric consistency: 2). A crash (killed by a signal, e.g.
+    the occasional "CUDA failure 999" abort under WSL) is run again up to `retries` times."""
+    for attempt in range(retries + 1):
+        try:
+            return _run_once(command, args, log, progress, total_images, passes)
+        except Crashed:
+            if attempt == retries:
+                raise
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(f"\n===== colmap {command} crashed; trying again\n")
+
+
+class Crashed(RuntimeError):
+    """COLMAP was killed by a signal rather than exiting with an error."""
+
+
+def _run_once(command, args, log, progress, total_images, passes) -> float:
     cmd = ["colmap", command, *[str(a) for a in args]]
     start = time.time()
     done_passes, last, shown = 0, 0.0, 0.0
@@ -87,7 +103,8 @@ def run(command: str, args: list, log: Path, progress=None, total_images: int = 
                 proc.wait()
     if code != 0:
         tail = "\n".join(log.read_text(errors="replace").splitlines()[-8:])
-        raise RuntimeError(f"colmap {command} failed (exit {code}):\n{tail}")
+        error = Crashed if code < 0 else RuntimeError
+        raise error(f"colmap {command} failed (exit {code}):\n{tail}")
     return time.time() - start
 
 
@@ -327,13 +344,21 @@ the end when one is accepted."""
     work.mkdir(parents=True, exist_ok=True)
     names = sorted(p.name for p in images.glob("*.jpg"))
     candidates = candidates or CANDIDATES
-    secs, best, tried, done = {}, None, [], set()
+    secs, best, tried, done, broken = {}, None, [], set(), set()
     for i, (setup, mapper) in enumerate(candidates):
         p = span(progress, i / len(candidates), (i + 1) / len(candidates))
         db = work / f"{setup}.db"
+        if setup in broken:
+            continue
         if setup not in done:
-            for k, v in features(images, masks, db, setup, log, span(p, 0, 0.45)).items():
-                secs[f"{setup}_{k}"] = v
+            try:
+                for k, v in features(images, masks, db, setup, log, span(p, 0, 0.45)).items():
+                    secs[f"{setup}_{k}"] = v
+            except RuntimeError as e:  # e.g. a GPU crash in one setup: the others may still work
+                broken.add(setup)
+                tried.append({"setup": setup, "mapper": mapper, "placed": 0, "overlap": {},
+                              "accepted": False, "error": str(e).splitlines()[0]})
+                continue
             done.add(setup)
         out = work / f"{setup}_{mapper}"
         shutil.rmtree(out, ignore_errors=True)

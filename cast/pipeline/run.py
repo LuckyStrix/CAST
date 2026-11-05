@@ -92,6 +92,9 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
         model, secs, tried = colmap.poses(images, mask_dir if use_masks else None,
                                           run_dir / "sfm", log, progress=p, accept=good)
         for t in tried:
+            if "error" in t:
+                note(f"poses: {t['setup']} features failed, skipping it: {t['error']}")
+                continue
             o, f = t["overlap"], t["overlap"].get("flip", {})
             note(f"poses: {t['setup']} + {t['mapper']}: {t['placed']}/{total} placed, {o.get('shared', 0)} "
                  f"shared (spread {o.get('spread')}, {o.get('sectors')}/16), up angle "

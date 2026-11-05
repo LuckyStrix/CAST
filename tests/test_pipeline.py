@@ -279,6 +279,19 @@ def test_run_raises_on_failure(fake_colmap, tmp_path):
         colmap.run("mapper", [], tmp_path / "log.txt")
 
 
+def test_run_retries_a_crash_once(fake_colmap, tmp_path):
+    fake_colmap(["CUDA failure 999"], code=0)
+    exe = next((tmp_path / "bin").glob("colmap"))
+    # first call aborts (killed by a signal), the second succeeds
+    exe.write_text(f"#!/bin/sh\nif [ -e {tmp_path}/once ]; then echo ok; exit 0; fi\n"
+                   f"touch {tmp_path}/once\nkill -ABRT $$\n")
+    colmap.run("feature_extractor", [], tmp_path / "log.txt")
+    assert "crashed; trying again" in (tmp_path / "log.txt").read_text()
+    (tmp_path / "once").unlink()
+    with pytest.raises(colmap.Crashed):
+        colmap.run("feature_extractor", [], tmp_path / "log.txt", retries=0)
+
+
 def _flip_scene(turned: bool):
     """Points on a flat slab; pass 1 cameras above it, pass 2 below (turned over) or above."""
     rng = np.random.default_rng(1)
@@ -318,3 +331,20 @@ def test_poses_tries_candidates_until_one_is_accepted(monkeypatch, tmp_path):
     assert [t["accepted"] for t in tried] == [False, True]
     assert [t["setup"] for t in tried] == ["aliked", "sift"]
     assert calls[0] == ("features", "aliked") and ("features", "sift") in calls
+
+
+def test_poses_skips_a_setup_whose_features_crash(monkeypatch, tmp_path):
+    def features(images, masks, db, setup, log, progress=None):
+        if setup == "aliked":
+            raise colmap.Crashed("colmap feature_extractor failed (exit -6):\nCUDA failure 999")
+        return {}
+
+    monkeypatch.setattr(colmap, "features", features)
+    monkeypatch.setattr(colmap, "run", lambda cmd, *a, **k: 1.0)
+    monkeypatch.setattr(colmap, "largest", lambda out, log: colmap.Model(
+        out, ["p1_1.jpg"], np.zeros((1, 3)), np.zeros((1, 3)), np.zeros((1, 3)), 1, 0.1, {}))
+    (tmp_path / "img").mkdir()
+    model, _, tried = colmap.poses(tmp_path / "img", None, tmp_path / "w", tmp_path / "log")
+    assert model.folder.name == "sift_global_mapper"
+    assert tried[0]["setup"] == "aliked" and "exit -6" in tried[0]["error"]
+    assert [t["setup"] for t in tried] == ["aliked", "sift"]  # aliked's second mapper skipped
