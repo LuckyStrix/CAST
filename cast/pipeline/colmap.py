@@ -16,19 +16,10 @@ import numpy as np
 
 from cast.pipeline import PipelineError
 
-# ALIKED features + LightGlue matching (COLMAP's own ONNX models, BSD-3 / Apache-2.0). On the
-# turned-over box they joined the two sides with shared points all round the object, where
-# SIFT left them apart or joined along one edge (Nov 2026 experiment, see PLAN.md).
 MODELS = Path(os.environ.get("CAST_MODELS", "/opt/cast/models"))
-FEATURES = ["--FeatureExtraction.type", "ALIKED_N16ROT",
-            "--FeatureExtraction.max_image_size", "2048",
-            "--AlikedExtraction.max_num_features", "8192",
-            "--AlikedExtraction.n16rot_model_path", MODELS / "aliked-n16rot.onnx"]
-MATCHING = ["--FeatureMatching.type", "ALIKED_LIGHTGLUE",
-            "--AlikedMatching.lightglue_model_path", MODELS / "aliked-lightglue.onnx",
-            "--AlikedMatching.bruteforce_model_path", MODELS / "bruteforce-matcher.onnx"]
 EXHAUSTIVE_MAX = 250  # above this many frames, match a chosen list of pairs
 PAIR_WINDOW, PAIR_STRIDE = 10, 8
+MIN_FLIP_ANGLE = 120  # degrees between the passes' average camera "up" after a turn-over
 MIN_REGISTERED = 0.8  # fraction of frames that must get a camera pose
 
 def available() -> bool:
@@ -183,6 +174,29 @@ def join_quality(xyz: np.ndarray, kinds: list) -> dict:
     return {"spread": round(spread, 2), "sectors": sectors}
 
 
+def flip_check(names: list, centres: np.ndarray, ups: np.ndarray, xyz: np.ndarray) -> dict:
+    """Was the object really turned over between pass 1 and pass 2?
+
+    Pass 1 films the object from above; after turning it over, pass 2 films what was its
+    underside. So, seen from the object, the two passes' cameras must be on opposite sides of
+    its thinnest axis, and their average "up" must point nearly opposite ways. A box or tablet
+    looks much like itself flipped, so matching can find a tidy mirror solution with pass 2
+    laid onto pass 1's side (both camera sets on one side, "up" within a few degrees)."""
+    p1 = np.array([n.startswith("p1_") for n in names])
+    p2 = np.array([n.startswith("p2_") for n in names])
+    if not p1.any() or not p2.any() or len(xyz) < 10:
+        return {"turned_over": False, "up_angle": 0.0, "opposite_sides": False}
+    centre = np.median(xyz, 0)
+    axis = np.linalg.svd(xyz - centre, full_matrices=False)[2][2]
+    h = (centres - centre) @ axis
+    u1, u2 = ups[p1].mean(0), ups[p2].mean(0)
+    cos = float(u1 @ u2 / (np.linalg.norm(u1) * np.linalg.norm(u2)))
+    angle = float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+    opposite = bool(np.sign(np.median(h[p1])) != np.sign(np.median(h[p2])))
+    return {"turned_over": opposite and angle >= MIN_FLIP_ANGLE, "up_angle": round(angle),
+            "opposite_sides": opposite}
+
+
 def pass_overlap(images_text: str, points_text: str) -> dict:
     """How many 3D points each pass saw alone, and how many were seen from both ("shared"),
     plus the points' count and mean reprojection error ("_points", "_error"), in one read.
@@ -204,6 +218,7 @@ def pass_overlap(images_text: str, points_text: str) -> dict:
             kinds.append(key)
     if len({k for k in kinds if k != "shared"}) > 1 or out["shared"]:
         out.update(join_quality(np.array(xyz).reshape(-1, 3), kinds))
+    out["_xyz"] = np.array(xyz).reshape(-1, 3)
     out["_points"] = len(errors)
     out["_error"] = float(np.mean(errors)) if errors else float("nan")
     return out
@@ -222,6 +237,9 @@ def model_from_text(folder: Path, txt: Path) -> Model:
     images_text = (txt / "images.txt").read_text(errors="replace")
     overlap = pass_overlap(images_text, (txt / "points3D.txt").read_text(errors="replace"))
     names, centres, ups, fwds = parse_images_txt(images_text)
+    xyz = overlap.pop("_xyz")
+    if any(n.startswith("p2_") for n in names):
+        overlap["flip"] = flip_check(names, centres, ups, xyz)
     return Model(folder, names, centres, ups, fwds, overlap.pop("_points"),
                  overlap.pop("_error"), overlap)
 
@@ -255,55 +273,90 @@ def span(progress, lo: float, hi: float):
     return (lambda f: progress(lo + (hi - lo) * f)) if progress else None
 
 
-def poses(images: Path, masks: Path | None, work: Path, log: Path,
-          progress=None) -> tuple[Model, dict]:
-    """Features, matching, mapping. Returns the model with the most frames, and timings."""
-    work.mkdir(parents=True, exist_ok=True)
-    db = work / "database.db"
-    for old in work.glob("database.db*"):
-        old.unlink()
-    names = sorted(p.name for p in images.glob("*.jpg"))
-    secs = {}
+# Feature setups. ALIKED + LightGlue (COLMAP's ONNX models, BSD-3 / Apache-2.0) matches more
+# across the turn-over; SIFT is COLMAP's classic.
+SETUPS = {
+    "aliked": (["--FeatureExtraction.type", "ALIKED_N16ROT",
+                "--FeatureExtraction.max_image_size", "2048",
+                "--AlikedExtraction.max_num_features", "8192",
+                "--AlikedExtraction.n16rot_model_path", MODELS / "aliked-n16rot.onnx"],
+               ["--FeatureMatching.type", "ALIKED_LIGHTGLUE",
+                "--AlikedMatching.lightglue_model_path", MODELS / "aliked-lightglue.onnx",
+                "--AlikedMatching.bruteforce_model_path", MODELS / "bruteforce-matcher.onnx"]),
+    "sift": (["--FeatureExtraction.type", "SIFT", "--FeatureExtraction.max_image_size", "3200",
+              "--SiftExtraction.max_num_features", "16384"],
+             ["--FeatureMatching.type", "SIFT_BRUTEFORCE"]),
+}
+# Tried in order until one passes `accept`. On the turned-over box (Nov 2026) only SIFT +
+# global mapper got the turn-over right; ALIKED + incremental joined best but mirror-imaged.
+# Symmetric objects can fool any one setup, so several are tried and checked.
+CANDIDATES = [("aliked", "mapper"), ("sift", "global_mapper"), ("aliked", "global_mapper"),
+              ("sift", "mapper")]
 
+
+def features(images: Path, masks: Path | None, db: Path, setup: str, log: Path,
+             progress=None) -> dict:
+    """Extract and match one feature setup into `db`. Returns timings."""
+    for old in db.parent.glob(db.name + "*"):
+        old.unlink()
+    extract, match = SETUPS[setup]
+    names = sorted(p.name for p in images.glob("*.jpg"))
     args = ["--database_path", db, "--image_path", images,
             "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "SIMPLE_RADIAL",
-            "--FeatureExtraction.use_gpu", "1", *FEATURES]
+            "--FeatureExtraction.use_gpu", "1", *extract]
     if masks is not None:
         args += ["--ImageReader.mask_path", masks]
-    secs["features"] = run("feature_extractor", args, log, span(progress, 0, 0.2))
-
+    secs = {"features": run("feature_extractor", args, log, span(progress, 0, 0.4))}
     if len(names) <= EXHAUSTIVE_MAX:
         matcher, margs = "exhaustive_matcher", []
     else:
-        pairs = work / "pairs.txt"
+        pairs = db.parent / "pairs.txt"
         pairs.write_text("".join(f"{a} {b}\n" for a, b in match_pairs(names)))
         matcher, margs = "matches_importer", ["--match_list_path", pairs, "--match_type", "pairs"]
     secs["matching"] = run(matcher, ["--database_path", db, "--FeatureMatching.use_gpu", "1",
-                                     *MATCHING, *margs], log, span(progress, 0.2, 0.55))
+                                     *match, *margs], log, span(progress, 0.4, 1.0))
+    return secs
 
-    best = None
-    # Incremental first: it calibrates the lens as it goes (video has no lens metadata) and its
-    # solver is fast on the CPU. The global mapper (no focal prior, and its bundle adjustment
-    # falls back to slow dense solvers without CUDA Ceres) is only a fallback.
-    for mapper, part in (("mapper", (0.55, 0.95)), ("global_mapper", (0.95, 1.0))):
-        out = work / mapper
+
+def poses(images: Path, masks: Path | None, work: Path, log: Path, progress=None,
+          accept=lambda model: True, candidates=None) -> tuple[Model, dict, list]:
+    """Camera poses: each (feature setup, mapper) candidate in turn until `accept(model)` says
+    one is good. Returns (the accepted model, or the largest if none was, timings, one summary
+    per candidate tried). Each candidate has an equal share of the progress bar, which jumps to
+the end when one is accepted."""
+    work.mkdir(parents=True, exist_ok=True)
+    names = sorted(p.name for p in images.glob("*.jpg"))
+    candidates = candidates or CANDIDATES
+    secs, best, tried, done = {}, None, [], set()
+    for i, (setup, mapper) in enumerate(candidates):
+        p = span(progress, i / len(candidates), (i + 1) / len(candidates))
+        db = work / f"{setup}.db"
+        if setup not in done:
+            for k, v in features(images, masks, db, setup, log, span(p, 0, 0.45)).items():
+                secs[f"{setup}_{k}"] = v
+            done.add(setup)
+        out = work / f"{setup}_{mapper}"
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir()
         try:
-            secs[mapper] = run(mapper, ["--database_path", db, "--image_path", images,
-                                        "--output_path", out], log,
-                               span(progress, *part), total_images=len(names))
+            secs[f"{setup}_{mapper}"] = run(mapper, ["--database_path", db, "--image_path",
+                                                     images, "--output_path", out], log,
+                                            span(p, 0.45, 1.0), total_images=len(names))
             model = largest(out, log)
         except RuntimeError:
             model = None
+        ok = bool(model) and accept(model)
+        tried.append({"setup": setup, "mapper": mapper,
+                      "placed": len(model.names) if model else 0,
+                      "overlap": model.overlap if model else {}, "accepted": ok})
+        if ok:
+            return model, secs, tried
         if model and (best is None or len(model.names) > len(best.names)):
             best = model
-        if best and len(best.names) >= MIN_REGISTERED * len(names):
-            break
     if best is None:
         raise PipelineError("No camera positions could be found. The object needs more texture "
                             "or light, or the walk round was too fast.")
-    return best, secs
+    return best, secs, tried
 
 
 def undistort(images: Path, model_dir: Path, work: Path, log: Path, max_size: int,

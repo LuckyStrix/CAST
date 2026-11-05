@@ -69,16 +69,38 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
         report["masks"] = masks.make_masks(images, mask_dir, masks.GROW_FOR_POSES, progress=p)
 
     def do_poses(p):
-        model, secs = colmap.poses(images, mask_dir if use_masks else None, run_dir / "sfm", log,
-                                   progress=p)
         total = len(list(images.glob("*.jpg")))
-        per_pass = {}
-        for k in sorted({f.name.split("_")[0] for f in images.glob("*.jpg")}):
-            per_pass[k] = {"frames": len(list(images.glob(f"{k}_*.jpg"))),
-                           "placed": sum(n.startswith(k + "_") for n in model.names)}
+        frames_per_pass = {k: len(list(images.glob(f"{k}_*.jpg")))
+                           for k in sorted({f.name.split("_")[0] for f in images.glob("*.jpg")})}
+        two_sides = use_masks and len(frames_per_pass) > 1
+
+        def placed(model):
+            return {k: {"frames": n, "placed": sum(x.startswith(k + "_") for x in model.names)}
+                    for k, n in frames_per_pass.items()}
+
+        def joined(model):
+            o = model.overlap
+            return (o.get("shared", 0) >= MIN_SHARED_POINTS and o.get("spread", 0) >= MIN_SPREAD
+                    and o.get("sectors", 0) >= MIN_SECTORS
+                    and all(v["placed"] >= 0.5 * v["frames"] for v in placed(model).values()))
+
+        def good(model):
+            if len(model.names) < colmap.MIN_REGISTERED * total:
+                return False
+            return not two_sides or (joined(model) and model.overlap["flip"]["turned_over"])
+
+        model, secs, tried = colmap.poses(images, mask_dir if use_masks else None,
+                                          run_dir / "sfm", log, progress=p, accept=good)
+        for t in tried:
+            o, f = t["overlap"], t["overlap"].get("flip", {})
+            note(f"poses: {t['setup']} + {t['mapper']}: {t['placed']}/{total} placed, {o.get('shared', 0)} "
+                 f"shared (spread {o.get('spread')}, {o.get('sectors')}/16), up angle "
+                 f"{f.get('up_angle')}, opposite sides {f.get('opposite_sides')} -> "
+                 f"{'accepted' if t['accepted'] else 'rejected'}")
+        per_pass = placed(model)
         report["poses"] = {"placed": len(model.names), "frames": total, "passes": per_pass,
                            "points": model.points, "error_px": round(model.error, 3),
-                           "overlap": model.overlap,
+                           "overlap": model.overlap, "tried": tried,
                            "colmap_seconds": {k: round(v) for k, v in secs.items()}}
         state["model"] = str(model.folder)
         state["cameras"] = {"names": model.names, "centres": model.centres.tolist(),
@@ -87,16 +109,9 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
         if len(model.names) < colmap.MIN_REGISTERED * total:
             raise PipelineError(f"Only {len(model.names)} of {total} frames could be placed. "
                                 "Walk slower and keep the whole object in view.")
-        if use_masks and len(per_pass) > 1:  # in the ground nothing moved: no join to check
-            o = model.overlap
-            shared = o.get("shared", 0)
-            joined = (shared >= MIN_SHARED_POINTS and o.get("spread", 0) >= MIN_SPREAD
-                      and o.get("sectors", 0) >= MIN_SECTORS
-                      and all(p["placed"] >= 0.5 * p["frames"] for p in per_pass.values()))
-            report["poses"]["joined"] = joined
-            note(f"poses: {shared} points seen from both passes, spread {o.get('spread')}, "
-                 f"{o.get('sectors')}/16 sectors -> {'joined' if joined else 'NOT joined'}")
-            if not joined:
+        if two_sides:  # in the ground nothing moved: no join to check
+            report["poses"]["joined"] = joined(model) and model.overlap["flip"]["turned_over"]
+            if not report["poses"]["joined"]:
                 raise PipelineError("The two sides could not be joined into one model. Film "
                                     "the edges slowly, before and after turning the object over, "
                                     "and keep the object filling the box on screen.")

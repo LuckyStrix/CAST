@@ -28,10 +28,12 @@ RUN mkdir -p /opt/cast/models && cd /opt/cast/models \
     3c1282f96d83f5ffc861a873298d08bbe5219f59af59223f5ceab5c41a182a47 bruteforce-matcher.onnx \
     | sha256sum -c -
 
-# COLMAP's ONNX Runtime dlopens "libcudnn.so", which the base image lacks: offer the pip
-# cuDNN under that name. Only cuDNN, and *after* the image's own paths, so COLMAP keeps the
-# CUDA libraries it was built against.
-RUN mkdir -p /opt/cast/cudalibs && for so in /opt/venv/lib/python3*/site-packages/nvidia/cudnn/lib/*.so*; do \
+# COLMAP's built-in ONNX Runtime (for ALIKED/LightGlue) is built for CUDA 12 and dlopens
+# "libcudnn.so". The pip ONNX Runtime above (for rembg) is a CUDA 13 build with its own cuDNN,
+# loaded by its own preload_dlls(). Mixing the two failed ("CUDA failure 999"), so COLMAP gets
+# a separate cuDNN for CUDA 12, placed after the image's own CUDA 12 libraries.
+RUN pip install --no-cache-dir --target /opt/cast/cudnn12 "nvidia-cudnn-cu12>=9,<10" \
+ && mkdir -p /opt/cast/cudalibs && for so in /opt/cast/cudnn12/nvidia/cudnn/lib/*.so*; do \
       n=$(basename "$so"); ln -sf "$so" "/opt/cast/cudalibs/$n"; ln -sf "$so" "/opt/cast/cudalibs/${n%%.so*}.so"; done
 ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/opt/cast/cudalibs
 

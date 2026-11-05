@@ -277,3 +277,44 @@ def test_run_raises_on_failure(fake_colmap, tmp_path):
     fake_colmap(["boom"], code=3)
     with pytest.raises(RuntimeError, match="exit 3"):
         colmap.run("mapper", [], tmp_path / "log.txt")
+
+
+def _flip_scene(turned: bool):
+    """Points on a flat slab; pass 1 cameras above it, pass 2 below (turned over) or above."""
+    rng = np.random.default_rng(1)
+    xyz = np.c_[rng.uniform(-2, 2, 500), rng.uniform(-1.5, 1.5, 500), rng.normal(0, 0.1, 500)]
+    names = [f"p1_{i:06d}.jpg" for i in range(10)] + [f"p2_{i:06d}.jpg" for i in range(10)]
+    ang = np.linspace(0, 2 * np.pi, 10, endpoint=False)
+    ring = np.c_[3 * np.cos(ang), 3 * np.sin(ang)]
+    z2 = -2 if turned else 2
+    centres = np.r_[np.c_[ring, np.full(10, 2.0)], np.c_[ring, np.full(10, z2)]]
+    ups = np.r_[np.tile([0, 0, 1.0], (10, 1)), np.tile([0, 0, -1.0 if turned else 1.0], (10, 1))]
+    return names, centres, ups, xyz
+
+
+def test_flip_check_rejects_mirror_solutions():
+    good = colmap.flip_check(*_flip_scene(turned=True))
+    assert good["turned_over"] and good["opposite_sides"] and good["up_angle"] == 180
+    mirror = colmap.flip_check(*_flip_scene(turned=False))  # pass 2 laid onto pass 1's side
+    assert not mirror["turned_over"] and not mirror["opposite_sides"] and mirror["up_angle"] == 0
+
+
+def test_poses_tries_candidates_until_one_is_accepted(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(colmap, "features", lambda *a, **k: calls.append(("features", a[3])) or {})
+    monkeypatch.setattr(colmap, "run", lambda cmd, *a, **k: calls.append((cmd,)) or 1.0)
+    models = iter([None, "second"])
+
+    def fake_largest(out, log):
+        m = next(models)
+        return m and colmap.Model(out, ["p1_1.jpg"], np.zeros((1, 3)), np.zeros((1, 3)),
+                                  np.zeros((1, 3)), 1, 0.1, {"tag": m})
+
+    monkeypatch.setattr(colmap, "largest", fake_largest)
+    (tmp_path / "img").mkdir()
+    model, _, tried = colmap.poses(tmp_path / "img", None, tmp_path / "w", tmp_path / "log",
+                                   accept=lambda m: m.overlap["tag"] == "second")
+    assert model.overlap["tag"] == "second"
+    assert [t["accepted"] for t in tried] == [False, True]
+    assert [t["setup"] for t in tried] == ["aliked", "sift"]
+    assert calls[0] == ("features", "aliked") and ("features", "sift") in calls
