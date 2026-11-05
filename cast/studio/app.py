@@ -205,7 +205,7 @@ def create_app(cfg: config.Config | None = None) -> FastAPI:
             meta = json.loads(cap["meta"])
             meta.pop("report", None)
             meta.pop("attempts", None)
-            db.set_capture(con, cid, status="checked", error="", stage="", meta=meta)
+            db.set_capture(con, cid, status="checked", error="", stage="", meta=meta, progress={})
         return {"ok": True}
 
     return app

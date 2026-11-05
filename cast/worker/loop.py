@@ -153,7 +153,8 @@ def reconstruct(cfg: config.Config, cap) -> None:
     with db.connect(cfg.db) as con:
         if meta["attempts"] > MAX_ATTEMPTS:
             log.error("capture %s: reconstruction stopped %d times; giving up", cid, MAX_ATTEMPTS)
-            db.set_capture(con, cid, status="failed", stage="", error=CRASHED, meta=meta)
+            db.set_capture(con, cid, status="failed", stage="", error=CRASHED, meta=meta,
+                           progress={})
             return
         db.set_capture(con, cid, status="processing", error="", meta=meta)
 
@@ -216,7 +217,7 @@ def step_reconstruct(cfg: config.Config) -> bool:
     except Exception:  # a bug, not the capture's fault: keep it retryable from studio
         log.exception("reconstructing capture %s failed", cap["id"])
         with db.connect(cfg.db) as con:
-            db.set_capture(con, cap["id"], status="failed", stage="", error=CRASHED)
+            db.set_capture(con, cap["id"], status="failed", stage="", error=CRASHED, progress={})
     return True
 
 

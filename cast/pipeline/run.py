@@ -87,7 +87,7 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
         if len(model.names) < colmap.MIN_REGISTERED * total:
             raise PipelineError(f"Only {len(model.names)} of {total} frames could be placed. "
                                 "Walk slower and keep the whole object in view.")
-        if len(per_pass) > 1:
+        if use_masks and len(per_pass) > 1:  # in the ground nothing moved: no join to check
             o = model.overlap
             shared = o.get("shared", 0)
             joined = (shared >= MIN_SHARED_POINTS and o.get("spread", 0) >= MIN_SPREAD

@@ -13,8 +13,8 @@ def test_passes_skip_the_turn_over():
     markers = [{"t": 0, "event": "start"}, {"t": 30, "event": "pass1_end"},
                {"t": 40, "event": "pass2_start"}, {"t": 70, "event": "stop"}]
     assert frames.passes(markers, 70.5, "object") == [(1, 0, 29.3), (2, 40.7, 70)]
-    # in the ground: nothing moves, so the whole recording is one segment
-    assert frames.passes(markers, 70.5, "in-situ") == [(1, 0, 70)]
+    # in the ground: the pause between loops is left out too, with a smaller margin
+    assert frames.passes(markers, 70.5, "in-situ") == [(1, 0, 29.7), (2, 40.3, 70)]
     # no markers (e.g. an old capture): the whole video
     assert frames.passes([], 12, "object") == [(1, 0, 12)]
     # a pass too short to use is dropped, and the other keeps its real number
@@ -243,3 +243,37 @@ def test_join_quality_tells_real_joins_from_false_ones():
     false = colmap.join_quality(rim, one_edge)
     assert false["spread"] < 0.4 and false["sectors"] <= 6
     assert colmap.join_quality(rim[:5], kinds[:5]) == {"spread": 0.0, "sectors": 0}
+
+
+@pytest.fixture
+def fake_colmap(tmp_path, monkeypatch):
+    """A `colmap` on PATH that prints the given lines, then exits with the given code."""
+    def make(lines, code=0):
+        exe = tmp_path / "bin" / "colmap"
+        exe.parent.mkdir(exist_ok=True)
+        body = "".join(f"echo '{ln}'\n" for ln in lines)
+        exe.write_text(f"#!/bin/sh\n{body}exit {code}\n")
+        exe.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{exe.parent}:" + __import__("os").environ["PATH"])
+    return make
+
+
+def test_run_progress_never_goes_back_and_errors_dont_stop_it(fake_colmap, tmp_path):
+    fake_colmap(["Registering image #1 (50)", "Registering image #2 (90)",
+                 "Registering image #3 (10)", "done"])  # a second sub-model counts from 0
+    seen = []
+
+    def progress(f):
+        seen.append(f)
+        if len(seen) == 2:
+            raise RuntimeError("database is locked")  # display only: must not stop COLMAP
+
+    colmap.run("mapper", [], tmp_path / "log.txt", progress, total_images=100)
+    assert seen == [0.5, 0.9, 0.9]
+    assert "done" in (tmp_path / "log.txt").read_text()
+
+
+def test_run_raises_on_failure(fake_colmap, tmp_path):
+    fake_colmap(["boom"], code=3)
+    with pytest.raises(RuntimeError, match="exit 3"):
+        colmap.run("mapper", [], tmp_path / "log.txt")

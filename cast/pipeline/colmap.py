@@ -35,6 +35,12 @@ def available() -> bool:
     return shutil.which("colmap") is not None
 
 
+def log_error(text: str) -> None:
+    import logging
+
+    logging.getLogger("cast.pipeline").exception(text)
+
+
 _COUNT = re.compile(r"\[(\d+)/(\d+)\]")  # "Processed file [12/160]", "Fusing image [3/160]"
 _BLOCK = re.compile(r"\[(\d+)/(\d+), (\d+)/(\d+)\]")  # exhaustive "Matching block [1/4, 2/4]"
 _VIEW = re.compile(r"Processing view (\d+) / (\d+)")  # patch_match_stereo
@@ -62,21 +68,32 @@ def run(command: str, args: list, log: Path, progress=None, total_images: int = 
     image (patch_match_stereo with geometric consistency: 2)."""
     cmd = ["colmap", command, *[str(a) for a in args]]
     start = time.time()
-    done_passes, last = 0, 0.0
+    done_passes, last, shown = 0, 0.0, 0.0
     with open(log, "a", encoding="utf-8", errors="replace") as fh:
         fh.write(f"\n===== {' '.join(cmd)}\n")
         fh.flush()
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 errors="replace", bufsize=1)
-        for line in proc.stdout:
-            fh.write(line)
-            f = line_fraction(line, total_images) if progress else None
-            if f is not None:
+        try:
+            for line in proc.stdout:
+                fh.write(line)
+                f = line_fraction(line, total_images) if progress else None
+                if f is None:
+                    continue
                 if f + 0.5 < last and done_passes + 1 < passes:  # counting started over
                     done_passes += 1
                 last = f
-                progress(min(1.0, (done_passes + f) / passes))
-        code = proc.wait()
+                # never backwards: a mapper that starts a second sub-model counts from 0 again
+                shown = max(shown, min(1.0, (done_passes + f) / passes))
+                try:
+                    progress(shown)
+                except Exception:  # noqa: BLE001 - progress is for display; never stop COLMAP
+                    log_error("progress update failed")
+            code = proc.wait()
+        finally:
+            if proc.poll() is None:  # leaving early (an error here): don't orphan COLMAP
+                proc.kill()
+                proc.wait()
     if code != 0:
         tail = "\n".join(log.read_text(errors="replace").splitlines()[-8:])
         raise RuntimeError(f"colmap {command} failed (exit {code}):\n{tail}")
@@ -115,14 +132,23 @@ def quat_to_rot(qw, qx, qy, qz) -> np.ndarray:
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
 
 
-def parse_images_txt(text: str):
-    """images.txt: pose lines alternate with point lines (which may be empty)."""
+def iter_images(text: str):
+    """images.txt entries as (header tokens, image name, observation tokens). Pose lines
+    alternate with observation lines, which may be empty (and the last one may be missing)."""
     lines = [ln for ln in text.splitlines() if not ln.startswith("#")]
     while lines and not lines[-1].strip():
         lines.pop()
-    names, centres, ups, fwds = [], [], [], []
-    for header in lines[0::2]:
+    if len(lines) % 2:
+        lines.append("")
+    for header, obs in zip(lines[0::2], lines[1::2]):
         tok = header.split()
+        if len(tok) >= 10:
+            yield tok, " ".join(tok[9:]), obs.split()
+
+
+def parse_images_txt(text: str):
+    names, centres, ups, fwds = [], [], [], []
+    for tok, _, _ in iter_images(text):
         R = quat_to_rot(*map(float, tok[1:5]))
         t = np.array(list(map(float, tok[5:8])))
         names.append(" ".join(tok[9:]))
@@ -158,21 +184,18 @@ def join_quality(xyz: np.ndarray, kinds: list) -> dict:
 
 
 def pass_overlap(images_text: str, points_text: str) -> dict:
-    """How many 3D points each pass saw alone, and how many were seen from both ("shared").
+    """How many 3D points each pass saw alone, and how many were seen from both ("shared"),
+    plus the points' count and mean reprojection error ("_points", "_error"), in one read.
 
     This is the real test of whether two passes joined: frames can all get a position while
     the two sides' positions only rest on a few (possibly wrong) common points."""
-    lines = [ln for ln in images_text.splitlines() if not ln.startswith("#")]
-    side = {}
-    for header in lines[0::2]:
-        tok = header.split()
-        if len(tok) >= 10:
-            side[tok[0]] = tok[9].split("_")[0]
-    out, xyz, kinds = {"shared": 0}, [], []
+    side = {tok[0]: name.split("_")[0] for tok, name, _ in iter_images(images_text)}
+    out, xyz, kinds, errors = {"shared": 0}, [], [], []
     for ln in points_text.splitlines():
         if not ln or ln.startswith("#"):
             continue
         tok = ln.split()
+        errors.append(float(tok[7]))
         seen = {side.get(i) for i in tok[8::2]} - {None}
         key = "shared" if len(seen) > 1 else next(iter(seen), None)
         if key:
@@ -181,30 +204,50 @@ def pass_overlap(images_text: str, points_text: str) -> dict:
             kinds.append(key)
     if len({k for k in kinds if k != "shared"}) > 1 or out["shared"]:
         out.update(join_quality(np.array(xyz).reshape(-1, 3), kinds))
+    out["_points"] = len(errors)
+    out["_error"] = float(np.mean(errors)) if errors else float("nan")
     return out
 
 
-def read_model(folder: Path, log: Path) -> Model:
+def to_text(folder: Path, log: Path) -> Path:
     txt = folder.parent / (folder.name + "_txt")
     shutil.rmtree(txt, ignore_errors=True)
     txt.mkdir()
     run("model_converter", ["--input_path", folder, "--output_path", txt, "--output_type", "TXT"],
         log)
+    return txt
+
+
+def model_from_text(folder: Path, txt: Path) -> Model:
     images_text = (txt / "images.txt").read_text(errors="replace")
-    points_text = (txt / "points3D.txt").read_text(errors="replace")
+    overlap = pass_overlap(images_text, (txt / "points3D.txt").read_text(errors="replace"))
     names, centres, ups, fwds = parse_images_txt(images_text)
-    errs = [float(ln.split()[7]) for ln in points_text.splitlines()
-            if ln and not ln.startswith("#")]
-    shutil.rmtree(txt)
-    return Model(folder, names, centres, ups, fwds, len(errs),
-                 float(np.mean(errs)) if errs else float("nan"),
-                 pass_overlap(images_text, points_text))
+    return Model(folder, names, centres, ups, fwds, overlap.pop("_points"),
+                 overlap.pop("_error"), overlap)
+
+
+def read_model(folder: Path, log: Path) -> Model:
+    txt = to_text(folder, log)
+    try:
+        return model_from_text(folder, txt)
+    finally:
+        shutil.rmtree(txt)
 
 
 def largest(sparse: Path, log: Path) -> Model | None:
-    models = [read_model(p, log) for p in sorted(sparse.iterdir())
-              if p.is_dir() and (p / "images.bin").exists()]
-    return max(models, key=lambda m: len(m.names)) if models else None
+    """The sub-model with the most frames, read in full (the others are only counted)."""
+    best, best_n, texts = None, -1, []
+    try:
+        for folder in sorted(p for p in sparse.iterdir() if (p / "images.bin").exists()):
+            txt = to_text(folder, log)
+            texts.append(txt)
+            n = sum(1 for _ in iter_images((txt / "images.txt").read_text(errors="replace")))
+            if n > best_n:
+                best, best_n = (folder, txt), n
+        return model_from_text(*best) if best else None
+    finally:
+        for txt in texts:
+            shutil.rmtree(txt, ignore_errors=True)
 
 
 def span(progress, lo: float, hi: float):
@@ -242,14 +285,14 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path,
     # Incremental first: it calibrates the lens as it goes (video has no lens metadata) and its
     # solver is fast on the CPU. The global mapper (no focal prior, and its bundle adjustment
     # falls back to slow dense solvers without CUDA Ceres) is only a fallback.
-    for mapper in ("mapper", "global_mapper"):
+    for mapper, part in (("mapper", (0.55, 0.95)), ("global_mapper", (0.95, 1.0))):
         out = work / mapper
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir()
         try:
             secs[mapper] = run(mapper, ["--database_path", db, "--image_path", images,
                                         "--output_path", out], log,
-                               span(progress, 0.55, 1.0), total_images=len(names))
+                               span(progress, *part), total_images=len(names))
             model = largest(out, log)
         except RuntimeError:
             model = None
@@ -282,22 +325,15 @@ def crop_cameras(cameras_text: str, images_text: str, boxes: dict) -> tuple[str,
             if t[1] != "PINHOLE":
                 raise RuntimeError(f"undistorted camera model is {t[1]}, expected PINHOLE")
             cams[t[0]] = [float(v) for v in t[2:8]]  # w h fx fy cx cy
-    lines = [ln for ln in images_text.splitlines() if not ln.startswith("#")]
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if len(lines) % 2:
-        lines.append("")  # the last image's (empty) observation line
     out_cams, out_images = [], []
-    for header, pts in zip(lines[0::2], lines[1::2]):
-        t = header.split()
-        image_id, name = t[0], " ".join(t[9:])
+    for t, name, p in iter_images(images_text):
+        image_id = t[0]
         w, h, fx, fy, cx, cy = cams[t[8]]
         x0, y0, x1, y1 = boxes.get(name, (0, 0, int(w), int(h)))
         out_cams.append(f"{image_id} PINHOLE {x1 - x0} {y1 - y0} {fx!r} {fy!r} "
                         f"{cx - x0!r} {cy - y0!r}")
         t[8] = image_id
         out_images.append(" ".join(t))
-        p = pts.split()
         for i in range(0, len(p) - 2, 3):  # x y point3D_id
             p[i], p[i + 1] = repr(float(p[i]) - x0), repr(float(p[i + 1]) - y0)
         out_images.append(" ".join(p))

@@ -27,10 +27,13 @@ def passes(markers: list, duration: float, mode: str) -> list[tuple[int, float, 
     even when the other pass was too short to keep: later stages rely on p1 = the first side."""
     t = {m.get("event"): float(m.get("t", 0)) for m in markers or []}
     end = min(t.get("stop", duration), duration)
-    if mode == "object" and "pass1_end" in t and "pass2_start" in t:
-        segs = [(0.0, t["pass1_end"] - FLIP_MARGIN), (t["pass2_start"] + FLIP_MARGIN, end)]
+    if "pass1_end" in t and "pass2_start" in t:
+        # object: the turn-over (hands, moving object); in the ground: the pause between
+        # loops (reading the card, phone lowered). Either way, not frames to use.
+        margin = FLIP_MARGIN if mode == "object" else 0.3
+        segs = [(0.0, t["pass1_end"] - margin), (t["pass2_start"] + margin, end)]
     else:
-        segs = [(0.0, end)]  # one pass, or two continuous loops of a still scene
+        segs = [(0.0, end)]  # one pass
     return [(k, round(a, 2), round(b, 2)) for k, (a, b) in enumerate(segs, 1)
             if b - a >= MIN_SEGMENT]
 

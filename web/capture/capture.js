@@ -110,6 +110,7 @@ $("start-camera").addEventListener("click", async () => {
 
 function resetRecordUi() {
   $("rec").hidden = false;
+  $("rec").disabled = false;
   $("round-done").hidden = true;
   $("finish").hidden = true;
   $("flip").hidden = true;
@@ -142,16 +143,13 @@ const MAX_BITS = 80e6;
 async function lockCamera(track) {
   const applied = {};
   const caps = track.getCapabilities ? track.getCapabilities() : {};
+  // Only "single-shot": measure once, then hold. ("manual" without a focus distance or colour
+  // temperature can leave the lens at infinity or the colours wrong.)
   for (const key of ["focusMode", "exposureMode", "whiteBalanceMode"]) {
-    const modes = caps[key] || [];
-    const mode = ["single-shot", "manual"].find((m) => modes.includes(m));
-    if (!mode) continue;
+    if (!(caps[key] || []).includes("single-shot")) continue;
     try {
-      const c = { [key]: mode };
-      const now = track.getSettings();
-      if (key === "exposureMode" && mode === "manual" && now.exposureTime) c.exposureTime = now.exposureTime;
-      await track.applyConstraints({ advanced: [c] });
-      applied[key] = mode;
+      await track.applyConstraints({ advanced: [{ [key]: "single-shot" }] });
+      applied[key] = "single-shot";
     } catch { /* not supported on this phone */ }
   }
   return applied;
@@ -163,6 +161,8 @@ async function keepAwake() {
 }
 
 $("rec").addEventListener("click", async () => {
+  if ($("rec").disabled) return; // a second tap while the camera is being set up
+  $("rec").disabled = true;
   const mime = pickMime();
   const s = stream.getVideoTracks()[0].getSettings();
   const bits = Math.min(MAX_BITS, Math.max(12e6, (s.width || 1920) * (s.height || 1080) * (s.frameRate || 30) * 0.3));
@@ -347,8 +347,9 @@ async function pollStatus(id) {
       if (s.status === "processing") {
         const p = s.progress || {};
         const pct = Math.round((p.fraction || 0) * 100);
-        const mins = Math.max(1, Math.round((p.eta_seconds || 0) / 60));
-        showStatus(`${t("status_checked")} ${t("status_progress", { pct, mins })}`);
+        const mins = Math.max(1, Math.round(p.eta_seconds / 60));
+        showStatus(p.eta_seconds == null ? t("status_checked")
+          : `${t("status_checked")} ${t("status_progress", { pct, mins })}`);
       }
       if (s.status === "done") return showStatus(t("status_done"));
       if (s.status === "failed") return showStatus(t("status_model_failed", { error: s.error }));
