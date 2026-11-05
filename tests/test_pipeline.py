@@ -223,4 +223,23 @@ def test_pass_overlap_counts_shared_points():
               "1 0 0 0 0 0 0 0.5 1 0 2 0\n"  # side 1 only
               "2 0 0 0 0 0 0 0.5 1 1 3 4\n"  # both sides
               "3 0 0 0 0 0 0 0.5 3 9\n")  # side 2 only
-    assert colmap.pass_overlap(images, points) == {"shared": 1, "p1": 1, "p2": 1}
+    o = colmap.pass_overlap(images, points)
+    assert (o["shared"], o["p1"], o["p2"]) == (1, 1, 1)
+    assert o["spread"] == 0.0  # far too few points to judge: counts as not joined
+
+
+def test_join_quality_tells_real_joins_from_false_ones():
+    rng = np.random.default_rng(0)
+    # a box-like object: points on the rim of a 4 x 3 rectangle
+    t = rng.uniform(0, 14, 2000)
+    rim = np.stack([np.where(t < 4, t, np.where(t < 7, 4, np.where(t < 11, 11 - t, 0))),
+                    np.where(t < 4, 0, np.where(t < 7, t - 4, np.where(t < 11, 3, 14 - t))),
+                    rng.normal(0, 0.05, 2000)], 1)
+    kinds = ["p1" if i % 2 else "p2" for i in range(2000)]
+    everywhere = [("shared" if i % 7 == 0 else k) for i, k in enumerate(kinds)]
+    real = colmap.join_quality(rim, everywhere)
+    assert real["spread"] > 0.7 and real["sectors"] >= 14
+    one_edge = [("shared" if (rim[i, 1] == 0 and i % 3 == 0) else k) for i, k in enumerate(kinds)]
+    false = colmap.join_quality(rim, one_edge)
+    assert false["spread"] < 0.4 and false["sectors"] <= 6
+    assert colmap.join_quality(rim[:5], kinds[:5]) == {"spread": 0.0, "sectors": 0}

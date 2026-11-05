@@ -14,11 +14,13 @@ import numpy as np
 from cast.pipeline import PipelineError, colmap, frames, glb, masks, mesh
 
 STAGES = ["frames", "masks", "poses", "dense", "mesh"]
-# Two passes are joined only if enough 3D points were seen from both. Frames all getting a
-# position proves nothing: the first box run placed 158/160 frames on 42 shared points and
-# its halves were far apart.
-MIN_SHARED_POINTS = 300
-MIN_SHARED_FRACTION = 0.08
+# Two passes are joined only if enough 3D points were seen from both, spread round the object.
+# Frames all getting a position proves nothing: the first box run placed 158/160 frames on 42
+# shared points bunched on two lines, and its halves were far apart. Measured on the box:
+# false joins had spread 0.1-0.4 and 4-5 of 16 sectors; true joins 0.74-0.99 and 12-16.
+MIN_SHARED_POINTS = 100
+MIN_SPREAD = 0.5
+MIN_SECTORS = 10
 FRAME_SIZE = 3200  # long side of extracted frames: small objects need the pixels
 
 
@@ -86,12 +88,14 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
             raise PipelineError(f"Only {len(model.names)} of {total} frames could be placed. "
                                 "Walk slower and keep the whole object in view.")
         if len(per_pass) > 1:
-            shared = model.overlap.get("shared", 0)
-            joined = (shared >= MIN_SHARED_POINTS and shared >= MIN_SHARED_FRACTION * model.points
+            o = model.overlap
+            shared = o.get("shared", 0)
+            joined = (shared >= MIN_SHARED_POINTS and o.get("spread", 0) >= MIN_SPREAD
+                      and o.get("sectors", 0) >= MIN_SECTORS
                       and all(p["placed"] >= 0.5 * p["frames"] for p in per_pass.values()))
             report["poses"]["joined"] = joined
-            note(f"poses: {shared} points seen from both passes -> "
-                 f"{'joined' if joined else 'NOT joined'}")
+            note(f"poses: {shared} points seen from both passes, spread {o.get('spread')}, "
+                 f"{o.get('sectors')}/16 sectors -> {'joined' if joined else 'NOT joined'}")
             if not joined:
                 raise PipelineError("The two sides could not be joined into one model. Film "
                                     "the edges slowly, before and after turning the object over, "

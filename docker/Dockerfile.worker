@@ -17,6 +17,22 @@ ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1
 RUN pip install --no-cache-dir numpy scipy opencv-python-headless pillow open3d \
       "rembg[gpu]" "onnxruntime-gpu[cuda,cudnn]"
 
+# COLMAP's ALIKED + LightGlue models (fetched now: the reconstructor has no network), checked
+# against the hashes COLMAP itself expects.
+RUN mkdir -p /opt/cast/models && cd /opt/cast/models \
+ && base=https://github.com/colmap/colmap/releases/download/3.13.0 \
+ && python -c "import urllib.request as u; [u.urlretrieve(f'$base/{n}', n) for n in ['aliked-n16rot.onnx','aliked-lightglue.onnx','bruteforce-matcher.onnx']]" \
+ && printf '%s  %s\n' \
+    39c423d0a6f03d39ec89d3d1d61853765c2fb6a8b8381376c703e5758778a547 aliked-n16rot.onnx \
+    b9a5de7204648b18a8cf5dcac819f9d30de1a5961ef03756803c8b86c2dceb8d aliked-lightglue.onnx \
+    3c1282f96d83f5ffc861a873298d08bbe5219f59af59223f5ceab5c41a182a47 bruteforce-matcher.onnx \
+    | sha256sum -c -
+
+# COLMAP's ONNX Runtime dlopens "libcudnn.so" etc.; give it the pip-installed CUDA libraries
+RUN mkdir -p /opt/cast/cudalibs && for so in /opt/venv/lib/python3*/site-packages/nvidia/*/lib/*.so*; do \
+      n=$(basename "$so"); ln -sf "$so" "/opt/cast/cudalibs/$n"; ln -sf "$so" "/opt/cast/cudalibs/${n%%.so*}.so"; done
+ENV LD_LIBRARY_PATH=/opt/cast/cudalibs
+
 # The masking model is fetched now, so the worker never needs the internet
 USER cast
 RUN python -c "from rembg import new_session; new_session('birefnet-general-lite', providers=['CPUExecutionProvider'])"

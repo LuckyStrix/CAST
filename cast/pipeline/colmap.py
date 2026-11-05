@@ -4,6 +4,7 @@ Checked against COLMAP 4.2.1 (colmap/colmap image). Option names that changed be
 are looked up in the command's own help. Pose reading and pair lists come from FleshForge.
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -15,12 +16,20 @@ import numpy as np
 
 from cast.pipeline import PipelineError
 
+# ALIKED features + LightGlue matching (COLMAP's own ONNX models, BSD-3 / Apache-2.0). On the
+# turned-over box they joined the two sides with shared points all round the object, where
+# SIFT left them apart or joined along one edge (Nov 2026 experiment, see PLAN.md).
+MODELS = Path(os.environ.get("CAST_MODELS", "/opt/cast/models"))
+FEATURES = ["--FeatureExtraction.type", "ALIKED_N16ROT",
+            "--FeatureExtraction.max_image_size", "2048",
+            "--AlikedExtraction.max_num_features", "8192",
+            "--AlikedExtraction.n16rot_model_path", MODELS / "aliked-n16rot.onnx"]
+MATCHING = ["--FeatureMatching.type", "ALIKED_LIGHTGLUE",
+            "--AlikedMatching.lightglue_model_path", MODELS / "aliked-lightglue.onnx",
+            "--AlikedMatching.bruteforce_model_path", MODELS / "bruteforce-matcher.onnx"]
 EXHAUSTIVE_MAX = 250  # above this many frames, match a chosen list of pairs
 PAIR_WINDOW, PAIR_STRIDE = 10, 8
 MIN_REGISTERED = 0.8  # fraction of frames that must get a camera pose
-
-_help: dict = {}
-
 
 def available() -> bool:
     return shutil.which("colmap") is not None
@@ -74,16 +83,6 @@ def run(command: str, args: list, log: Path, progress=None, total_images: int = 
     return time.time() - start
 
 
-def option(command: str, *names: str) -> str:
-    if command not in _help:
-        done = subprocess.run(["colmap", command, "-h"], check=False, capture_output=True, text=True)
-        _help[command] = done.stdout + done.stderr
-    for name in names:
-        if name + " " in _help[command] or name + "\n" in _help[command]:
-            return name
-    raise RuntimeError(f"colmap {command} accepts none of {names}")
-
-
 def match_pairs(names: list, window: int = PAIR_WINDOW, stride: int = PAIR_STRIDE) -> list:
     """Neighbours in order plus every `stride`-th frame: links laps and both passes."""
     n, keep = len(names), set()
@@ -133,6 +132,31 @@ def parse_images_txt(text: str):
     return names, np.array(centres), np.array(ups), np.array(fwds)
 
 
+def join_quality(xyz: np.ndarray, kinds: list) -> dict:
+    """Where the points seen from both passes lie. A real join has them all round the object;
+    a false one has a few, bunched along one edge or line.
+
+    spread: size of the shared points' footprint on the object's two main axes, relative to
+    all points' (about 0.1-0.4 for the false joins seen, 0.7-1.0 for true ones).
+    sectors: of 16 directions round the object's centre, how many hold shared points."""
+    xyz = np.asarray(xyz, float)
+    shared = np.array([k == "shared" for k in kinds])
+    if len(xyz) < 10 or shared.sum() < 3:
+        return {"spread": 0.0, "sectors": 0}
+    d = np.linalg.norm(xyz - np.median(xyz, 0), axis=1)
+    keep = d < np.quantile(d, 0.95)  # far strays would stretch the axes
+    xyz, shared = xyz[keep], shared[keep]
+    if shared.sum() < 3:
+        return {"spread": 0.0, "sectors": 0}
+    mean = xyz.mean(0)
+    _, _, vt = np.linalg.svd(xyz - mean, full_matrices=False)
+    q = (xyz - mean) @ vt.T
+    spread = float(np.sqrt(np.prod(q[shared, :2].std(0)) / np.prod(q[:, :2].std(0))))
+    ang = np.arctan2(q[shared, 1], q[shared, 0])
+    sectors = len(set(((ang + np.pi) / (2 * np.pi) * 16).astype(int) % 16))
+    return {"spread": round(spread, 2), "sectors": sectors}
+
+
 def pass_overlap(images_text: str, points_text: str) -> dict:
     """How many 3D points each pass saw alone, and how many were seen from both ("shared").
 
@@ -144,14 +168,19 @@ def pass_overlap(images_text: str, points_text: str) -> dict:
         tok = header.split()
         if len(tok) >= 10:
             side[tok[0]] = tok[9].split("_")[0]
-    out = {"shared": 0}
+    out, xyz, kinds = {"shared": 0}, [], []
     for ln in points_text.splitlines():
         if not ln or ln.startswith("#"):
             continue
-        seen = {side.get(i) for i in ln.split()[8::2]} - {None}
+        tok = ln.split()
+        seen = {side.get(i) for i in tok[8::2]} - {None}
         key = "shared" if len(seen) > 1 else next(iter(seen), None)
         if key:
             out[key] = out.get(key, 0) + 1
+            xyz.append([float(v) for v in tok[1:4]])
+            kinds.append(key)
+    if len({k for k in kinds if k != "shared"}) > 1 or out["shared"]:
+        out.update(join_quality(np.array(xyz).reshape(-1, 3), kinds))
     return out
 
 
@@ -195,8 +224,7 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path,
 
     args = ["--database_path", db, "--image_path", images,
             "--ImageReader.single_camera", "1", "--ImageReader.camera_model", "SIMPLE_RADIAL",
-            option("feature_extractor", "--FeatureExtraction.use_gpu", "--SiftExtraction.use_gpu"),
-            "1"]
+            "--FeatureExtraction.use_gpu", "1", *FEATURES]
     if masks is not None:
         args += ["--ImageReader.mask_path", masks]
     secs["features"] = run("feature_extractor", args, log, span(progress, 0, 0.2))
@@ -207,12 +235,14 @@ def poses(images: Path, masks: Path | None, work: Path, log: Path,
         pairs = work / "pairs.txt"
         pairs.write_text("".join(f"{a} {b}\n" for a, b in match_pairs(names)))
         matcher, margs = "matches_importer", ["--match_list_path", pairs, "--match_type", "pairs"]
-    gpu = option(matcher, "--FeatureMatching.use_gpu", "--SiftMatching.use_gpu")
-    secs["matching"] = run(matcher, ["--database_path", db, gpu, "1", *margs], log,
-                           span(progress, 0.2, 0.55))
+    secs["matching"] = run(matcher, ["--database_path", db, "--FeatureMatching.use_gpu", "1",
+                                     *MATCHING, *margs], log, span(progress, 0.2, 0.55))
 
     best = None
-    for mapper in ("global_mapper", "mapper"):  # global first (fast); incremental if it falls short
+    # Incremental first: it calibrates the lens as it goes (video has no lens metadata) and its
+    # solver is fast on the CPU. The global mapper (no focal prior, and its bundle adjustment
+    # falls back to slow dense solvers without CUDA Ceres) is only a fallback.
+    for mapper in ("mapper", "global_mapper"):
         out = work / mapper
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir()
