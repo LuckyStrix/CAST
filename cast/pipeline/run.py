@@ -158,7 +158,7 @@ def process(video: Path, meta: dict, mode: str, run_dir: Path,
         if parts:
             out = []
             for v, uv, f, image in parts:
-                pv, pn = place(v, mesh.vertex_normals(v, f))
+                pv, pn = place(v, mesh.normals_for(v, m))
                 out.append((pv, pn, uv, f, image.read_bytes() if image else None))
             glb.write_textured_glb(run_dir / "model.glb", out)
             note(f"mesh: textured from {report['texture']['views']} photos in "

@@ -123,10 +123,12 @@ def make(dense: Path, vertices: np.ndarray, faces: np.ndarray, work: Path, log: 
     views = write_scene(dense / "images", (txt / "cameras.txt").read_text(),
                         (txt / "images.txt").read_text(), work / "scene")
     write_ply(work / "mesh.ply", vertices, faces)
-    obj = run_texrecon(work / "scene", work / "mesh.ply", work / "textured", log)
-    for junk in [*work.glob("*.spt"), *work.glob("*.vec"), work / "mesh.ply"]:
-        junk.unlink(missing_ok=True)  # texrecon's working files (hundreds of MB)
-    shutil.rmtree(work / "scene")
+    try:
+        obj = run_texrecon(work / "scene", work / "mesh.ply", work / "textured", log)
+    finally:  # texrecon's working files (hundreds of MB), whether it worked or not
+        for junk in [*work.glob("*.spt"), *work.glob("*.vec"), work / "mesh.ply"]:
+            junk.unlink(missing_ok=True)
+        shutil.rmtree(work / "scene", ignore_errors=True)
     parts = read_obj(obj)
     return parts, {"views": views, "parts": len(parts),
                    "textured": sum(1 for p in parts if p[3] is not None),

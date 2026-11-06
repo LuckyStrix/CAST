@@ -401,3 +401,20 @@ def test_placement_is_shared_by_parts():
     whole, _ = place(v, np.zeros((3, 3)))
     part, _ = place(v[1:], np.zeros((2, 3)))
     assert np.allclose(whole[1:], part) and np.ptp(whole, axis=0).max() == pytest.approx(mesh.SIZE)
+
+
+def test_part_normals_come_from_the_whole_mesh():
+    """A seam vertex copied into two parts gets the whole mesh's normal in both, not each
+    part's own (which would show a false crease under raking light)."""
+    import numpy as np
+    import pytest
+
+    pytest.importorskip("scipy")
+    from cast.pipeline import mesh
+
+    v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0.5]], float)
+    n = np.array([[0, 0, 1], [0.1, 0, 1], [0, 0.1, 1], [0.2, 0.2, 1]], float)
+    m = mesh.Mesh(v, np.array([[0, 1, 2], [1, 3, 2]]), None, n, {})
+    part_a, part_b = v[[0, 1, 2]], v[[1, 3, 2]]
+    assert np.allclose(mesh.normals_for(part_a, m)[1:], mesh.normals_for(part_b, m)[[0, 2]])
+    assert np.allclose(mesh.normals_for(part_b, m), n[[1, 3, 2]])

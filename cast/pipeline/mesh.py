@@ -52,7 +52,7 @@ def up_rotation(up: np.ndarray) -> np.ndarray:
 
 def build(cloud: Path, centre: np.ndarray, radius: float, depth: int = 10) -> Mesh:
     """The trimmed surface, in the camera model's coordinates (so photos can be projected onto
-    it); `upright` places it for viewing."""
+    it); `placement` stands it upright for viewing."""
     import open3d as o3d
     from scipy.spatial import cKDTree
 
@@ -101,13 +101,12 @@ def build(cloud: Path, centre: np.ndarray, radius: float, depth: int = 10) -> Me
     return Mesh(v, np.asarray(mesh.triangles), colors, np.asarray(mesh.vertex_normals), stats)
 
 
-def vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
-    n = np.zeros_like(vertices, dtype=np.float64)
-    fn = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]],
-                  vertices[faces[:, 2]] - vertices[faces[:, 0]])
-    for k in range(3):
-        np.add.at(n, faces[:, k], fn)
-    return n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+def normals_for(vertices: np.ndarray, m: Mesh) -> np.ndarray:
+    """Normals of the whole mesh `m` at `vertices` (copies of its vertices, e.g. the textured
+    parts), so shading runs smoothly across the seams between parts."""
+    from scipy.spatial import cKDTree
+
+    return m.normals[cKDTree(m.vertices).query(vertices)[1]]
 
 
 def placement(vertices: np.ndarray, centre: np.ndarray, up: np.ndarray):

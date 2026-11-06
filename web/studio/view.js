@@ -57,7 +57,8 @@ async function load() {
   model = gltf.scene;
   model.traverse((o) => {
     if (!o.isMesh) return;
-    o.geometry.computeVertexNormals();
+    // the model's own normals run smoothly across texture seams: compute only if missing
+    if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
     // colour from a texture (photos) or per vertex (points), whichever the model has
     const look = { map: o.material.map || null, vertexColors: !!o.geometry.attributes.color, side: THREE.DoubleSide };
     shaded[o.id] = new THREE.MeshStandardMaterial({ ...look, roughness: 1, metalness: 0 });
